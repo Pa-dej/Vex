@@ -1,9 +1,16 @@
 use std::io;
+use std::io::{Read, Write};
 
 use anyhow::{Context, Result, bail};
 use bytes::{BufMut, BytesMut};
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Handshake {
@@ -11,6 +18,31 @@ pub struct Handshake {
     pub server_address: String,
     pub server_port: u16,
     pub next_state: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoginPluginRequest {
+    pub message_id: i32,
+    pub channel: String,
+    pub data: Vec<u8>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct LoginPluginResponse {
+    pub message_id: i32,
+    pub success: bool,
+    pub data: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct VelocityForwardingPayload {
+    pub version: i32,
+    pub client_ip: String,
+    pub uuid_bytes: [u8; 16],
+    pub username: String,
+    pub properties_count: i32,
 }
 
 pub async fn read_packet(stream: &mut TcpStream, max_packet_size: usize) -> io::Result<Vec<u8>> {
@@ -88,12 +120,219 @@ pub fn parse_login_start_username(payload: &[u8]) -> Result<Option<String>> {
     Ok(Some(username))
 }
 
+#[cfg(test)]
+pub fn build_login_start_packet(username: &str) -> Vec<u8> {
+    let mut payload = BytesMut::with_capacity(username.len() + 8);
+    write_varint(0, &mut payload);
+    write_mc_string(username, &mut payload);
+    payload.to_vec()
+}
+
 pub fn build_login_disconnect(message: &str) -> Vec<u8> {
     let chat_json = serde_json::json!({ "text": message }).to_string();
     let mut payload = BytesMut::with_capacity(chat_json.len() + 8);
     write_varint(0, &mut payload);
     write_mc_string(&chat_json, &mut payload);
     payload.to_vec()
+}
+
+#[cfg(test)]
+pub fn build_login_plugin_request(message_id: i32, channel: &str, data: &[u8]) -> Vec<u8> {
+    let mut payload = BytesMut::with_capacity(channel.len() + data.len() + 16);
+    write_varint(0x04, &mut payload);
+    write_varint(message_id, &mut payload);
+    write_mc_string(channel, &mut payload);
+    payload.put_slice(data);
+    payload.to_vec()
+}
+
+pub fn parse_login_plugin_request(payload: &[u8]) -> Result<Option<LoginPluginRequest>> {
+    let (packet_id, mut offset) = parse_varint(payload).context("missing packet id")?;
+    if packet_id != 0x04 {
+        return Ok(None);
+    }
+    let (message_id, read) = parse_varint(&payload[offset..]).context("missing message id")?;
+    offset += read;
+    let (channel, read) = parse_mc_string(&payload[offset..]).context("missing channel")?;
+    offset += read;
+    let data = payload[offset..].to_vec();
+    Ok(Some(LoginPluginRequest {
+        message_id,
+        channel,
+        data,
+    }))
+}
+
+pub fn build_login_plugin_response(message_id: i32, success: bool, data: Option<&[u8]>) -> Vec<u8> {
+    let mut payload = BytesMut::with_capacity(data.map(|d| d.len()).unwrap_or(0) + 16);
+    write_varint(0x02, &mut payload);
+    write_varint(message_id, &mut payload);
+    payload.put_u8(if success { 1 } else { 0 });
+    if success {
+        if let Some(data) = data {
+            payload.put_slice(data);
+        }
+    }
+    payload.to_vec()
+}
+
+pub fn parse_set_compression_threshold(payload: &[u8]) -> Result<Option<i32>> {
+    let (packet_id, offset) = parse_varint(payload).context("missing packet id")?;
+    if packet_id != 0x03 {
+        return Ok(None);
+    }
+    let (threshold, _read) =
+        parse_varint(&payload[offset..]).context("missing compression threshold")?;
+    Ok(Some(threshold))
+}
+
+pub fn decode_login_packet_from_backend(
+    raw_payload: &[u8],
+    compression_enabled: bool,
+) -> Result<Vec<u8>> {
+    if !compression_enabled {
+        return Ok(raw_payload.to_vec());
+    }
+
+    let (data_length, read) =
+        parse_varint(raw_payload).context("missing compressed frame data length")?;
+    if data_length < 0 {
+        bail!("negative compressed frame data length");
+    }
+
+    if data_length == 0 {
+        return Ok(raw_payload[read..].to_vec());
+    }
+
+    let compressed = &raw_payload[read..];
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut decompressed = Vec::with_capacity(data_length as usize);
+    decoder
+        .read_to_end(&mut decompressed)
+        .context("failed to decompress login packet")?;
+    if decompressed.len() != data_length as usize {
+        bail!(
+            "decompressed size mismatch: expected {}, got {}",
+            data_length,
+            decompressed.len()
+        );
+    }
+    Ok(decompressed)
+}
+
+pub fn encode_login_packet_for_backend(
+    payload: &[u8],
+    compression_threshold: Option<i32>,
+) -> Result<Vec<u8>> {
+    let Some(threshold) = compression_threshold else {
+        return Ok(payload.to_vec());
+    };
+
+    if threshold < 0 {
+        return Ok(payload.to_vec());
+    }
+    let threshold = threshold as usize;
+
+    if payload.len() < threshold {
+        let mut out = BytesMut::with_capacity(payload.len() + 5);
+        write_varint(0, &mut out);
+        out.put_slice(payload);
+        return Ok(out.to_vec());
+    }
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(payload)
+        .context("failed to compress login packet")?;
+    let compressed = encoder.finish().context("failed to finalize compression")?;
+    let mut out = BytesMut::with_capacity(compressed.len() + 5);
+    write_varint(payload.len() as i32, &mut out);
+    out.put_slice(&compressed);
+    Ok(out.to_vec())
+}
+
+#[cfg(test)]
+pub fn parse_login_plugin_response(payload: &[u8]) -> Result<Option<LoginPluginResponse>> {
+    let (packet_id, mut offset) = parse_varint(payload).context("missing packet id")?;
+    if packet_id != 0x02 {
+        return Ok(None);
+    }
+    let (message_id, read) = parse_varint(&payload[offset..]).context("missing message id")?;
+    offset += read;
+    if payload.len() <= offset {
+        bail!("missing success flag");
+    }
+    let success = payload[offset] != 0;
+    offset += 1;
+    let data = if success {
+        Some(payload[offset..].to_vec())
+    } else {
+        None
+    };
+    Ok(Some(LoginPluginResponse {
+        message_id,
+        success,
+        data,
+    }))
+}
+
+pub fn build_velocity_modern_forwarding_payload(client_ip: &str, username: &str) -> Vec<u8> {
+    let mut payload = BytesMut::with_capacity(client_ip.len() + username.len() + 32);
+    write_varint(1, &mut payload);
+    write_mc_string(client_ip, &mut payload);
+    payload.put_slice(&offline_uuid(username));
+    write_mc_string(username, &mut payload);
+    write_varint(0, &mut payload);
+    payload.to_vec()
+}
+
+pub fn offline_uuid(username: &str) -> [u8; 16] {
+    let source = format!("OfflinePlayer:{username}");
+    *Uuid::new_v3(&Uuid::NAMESPACE_DNS, source.as_bytes()).as_bytes()
+}
+
+#[cfg(test)]
+pub fn parse_velocity_modern_forwarding_payload(
+    payload: &[u8],
+) -> Result<VelocityForwardingPayload> {
+    let (version, mut offset) = parse_varint(payload).context("missing velocity version")?;
+    let (client_ip, read) = parse_mc_string(&payload[offset..]).context("missing client ip")?;
+    offset += read;
+    if payload.len() < offset + 16 {
+        bail!("missing uuid bytes");
+    }
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&payload[offset..offset + 16]);
+    offset += 16;
+    let (username, read) = parse_mc_string(&payload[offset..]).context("missing username")?;
+    offset += read;
+    let (properties_count, _read) =
+        parse_varint(&payload[offset..]).context("missing properties count")?;
+    Ok(VelocityForwardingPayload {
+        version,
+        client_ip,
+        uuid_bytes,
+        username,
+        properties_count,
+    })
+}
+
+pub fn sign_hmac_sha256(secret: &str, payload: &[u8]) -> Result<[u8; 32]> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid hmac key"))?;
+    mac.update(payload);
+    let raw = mac.finalize().into_bytes();
+    let mut signature = [0u8; 32];
+    signature.copy_from_slice(raw.as_slice());
+    Ok(signature)
+}
+
+pub fn build_signed_velocity_forwarding_data(secret: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let signature = sign_hmac_sha256(secret, payload)?;
+    let mut out = Vec::with_capacity(32 + payload.len());
+    out.extend_from_slice(&signature);
+    out.extend_from_slice(payload);
+    Ok(out)
 }
 
 pub fn build_status_response(json: &str) -> Vec<u8> {
@@ -228,5 +467,28 @@ mod tests {
         assert_eq!(hs.server_address, "localhost");
         assert_eq!(hs.server_port, 25565);
         assert_eq!(hs.next_state, 2);
+    }
+
+    #[test]
+    fn velocity_payload_signing_roundtrip() {
+        let payload = build_velocity_modern_forwarding_payload("127.0.0.1", "Player");
+        let signed = build_signed_velocity_forwarding_data("secret", &payload).expect("signing");
+        assert_eq!(signed.len(), payload.len() + 32);
+        let parsed = parse_velocity_modern_forwarding_payload(&signed[32..]).expect("parse");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.client_ip, "127.0.0.1");
+        assert_eq!(parsed.uuid_bytes, offline_uuid("Player"));
+        assert_eq!(parsed.username, "Player");
+        assert_eq!(parsed.properties_count, 0);
+    }
+
+    #[test]
+    fn compressed_login_frame_roundtrip() {
+        let mut inner = BytesMut::new();
+        write_varint(0x02, &mut inner);
+        write_mc_string("ok", &mut inner);
+        let wrapped = encode_login_packet_for_backend(&inner, Some(1)).expect("encode");
+        let decoded = decode_login_packet_from_backend(&wrapped, true).expect("decode");
+        assert_eq!(decoded, inner.to_vec());
     }
 }

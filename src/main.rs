@@ -43,19 +43,13 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::new()?);
     let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
 
-    let state = RuntimeState::new(
-        Arc::new(config.clone()),
-        Arc::new(protocol_map),
-        metrics,
-        backends,
-    );
+    let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends);
 
     spawn_health_checker(state.clone());
 
     let admin_ctx = AdminContext {
         state: state.clone(),
         config_path: config_path.clone(),
-        protocol_map_path: protocol_map_path.clone(),
     };
     tokio::spawn(async move {
         if let Err(err) = run_admin_server(admin_ctx).await {
@@ -67,9 +61,10 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("ctrl-c received, initiating graceful shutdown");
+            let snapshot = shutdown_state.snapshot();
             shutdown_state
                 .shutdown
-                .trigger(shutdown_state.config.shutdown.disconnect_message.clone());
+                .trigger(snapshot.config.shutdown.disconnect_message.clone());
         }
     });
 

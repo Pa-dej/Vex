@@ -1,4 +1,7 @@
 [listener]
+# listener.bind is applied only on process start.
+# Changing port/address requires process restart.
+# routing, protocol_map, auth, and health are hot-applied via POST /reload.
 bind = "0.0.0.0:25577"
 max_packet_size = 8388608
 
@@ -29,7 +32,7 @@ address = "127.0.0.1:25565"
 weight = 1.0
 
 [observability]
-log_level = "info"
+log_level = "debug"
 
 [admin]
 bind = "127.0.0.1:8080"
@@ -41,3 +44,7 @@ disconnect_message = "Proxy is restarting, reconnect in a few seconds."
 
 [protocol_map]
 path = "config/protocol_ids.toml"
+
+[forwarding.velocity]
+enabled = true
+secret = "test-secret-123"

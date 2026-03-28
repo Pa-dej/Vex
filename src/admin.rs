@@ -18,11 +18,10 @@ use crate::state::RuntimeState;
 pub struct AdminContext {
     pub state: RuntimeState,
     pub config_path: PathBuf,
-    pub protocol_map_path: PathBuf,
 }
 
 pub async fn run_admin_server(ctx: AdminContext) -> anyhow::Result<()> {
-    let bind_addr = ctx.state.config.admin.bind.clone();
+    let bind_addr = ctx.state.snapshot().config.admin.bind.clone();
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -37,8 +36,9 @@ pub async fn run_admin_server(ctx: AdminContext) -> anyhow::Result<()> {
 }
 
 async fn healthz(State(ctx): State<AdminContext>) -> impl IntoResponse {
+    let snapshot = ctx.state.snapshot();
     let mut backends = Vec::new();
-    for backend in ctx.state.backends.backends() {
+    for backend in snapshot.backends.backends() {
         backends.push(BackendHealthView {
             name: backend.name().to_string(),
             address: backend.address().to_string(),
@@ -79,29 +79,45 @@ async fn metrics(State(ctx): State<AdminContext>) -> impl IntoResponse {
 }
 
 async fn reload(State(ctx): State<AdminContext>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &ctx.state.config.admin.auth_token) {
+    let snapshot = ctx.state.snapshot();
+    if let Err(code) = verify_token(&headers, &snapshot.config.admin.auth_token) {
         return (code, "unauthorized".to_string());
     }
-    match (
-        Config::load_or_default(&ctx.config_path),
-        ProtocolMap::load(&ctx.protocol_map_path),
-    ) {
-        (Ok(_cfg), Ok(_map)) => {
-            info!("reload validation successful");
-            (
-                StatusCode::OK,
-                "reload validated (apply-on-restart)".to_string(),
-            )
+    let cfg = match Config::load_or_default(&ctx.config_path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("config reload validation failed: {err:#}"),
+            );
         }
-        (Err(err), _) => (
-            StatusCode::BAD_REQUEST,
-            format!("config reload validation failed: {err:#}"),
-        ),
-        (_, Err(err)) => (
-            StatusCode::BAD_REQUEST,
-            format!("protocol map reload validation failed: {err:#}"),
-        ),
-    }
+    };
+
+    let protocol_path = PathBuf::from(&cfg.protocol_map.path);
+    let map = match ProtocolMap::load(&protocol_path) {
+        Ok(map) => map,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("protocol map reload validation failed: {err:#}"),
+            );
+        }
+    };
+
+    let backends =
+        match crate::backend::BackendPool::from_config(&cfg.routing, ctx.state.metrics.clone()) {
+            Ok(backends) => backends,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("routing reload validation failed: {err:#}"),
+                );
+            }
+        };
+
+    ctx.state.apply_reload(cfg, map, backends).await;
+    info!("reload applied via arcswap snapshot swap");
+    (StatusCode::OK, "reload applied atomically".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +130,8 @@ async fn set_auth_mode(
     headers: HeaderMap,
     Json(req): Json<AuthModeRequest>,
 ) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &ctx.state.config.admin.auth_token) {
+    let snapshot = ctx.state.snapshot();
+    if let Err(code) = verify_token(&headers, &snapshot.config.admin.auth_token) {
         return (code, "unauthorized".to_string());
     }
 
@@ -134,10 +151,11 @@ async fn set_auth_mode(
 }
 
 async fn shutdown(State(ctx): State<AdminContext>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(code) = verify_token(&headers, &ctx.state.config.admin.auth_token) {
+    let snapshot = ctx.state.snapshot();
+    if let Err(code) = verify_token(&headers, &snapshot.config.admin.auth_token) {
         return (code, "unauthorized".to_string());
     }
-    let message = ctx.state.config.shutdown.disconnect_message.clone();
+    let message = snapshot.config.shutdown.disconnect_message.clone();
     if !ctx.state.shutdown.trigger(message.clone()) {
         return (
             StatusCode::ACCEPTED,
@@ -145,7 +163,7 @@ async fn shutdown(State(ctx): State<AdminContext>, headers: HeaderMap) -> impl I
         );
     }
 
-    let drain = ctx.state.config.shutdown.drain_seconds;
+    let drain = snapshot.config.shutdown.drain_seconds;
     let shutdown = ctx.state.shutdown.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(drain)).await;

@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::mc::{
@@ -10,23 +10,21 @@ use crate::mc::{
 use crate::state::RuntimeState;
 
 pub fn spawn_health_checker(state: RuntimeState) {
-    for backend in state.backends.backends() {
-        let backend = backend.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            let cfg = &state.config.health;
-            let mut ticker = interval(Duration::from_millis(cfg.interval_ms));
-            loop {
-                ticker.tick().await;
-                if state.shutdown.is_draining() {
-                    return;
-                }
+    tokio::spawn(async move {
+        loop {
+            if state.shutdown.is_draining() {
+                return;
+            }
 
+            let snapshot = state.snapshot();
+            let cfg = snapshot.config.health.clone();
+
+            for backend in snapshot.backends.backends() {
                 let status_probe = probe_status(
                     backend.address(),
-                    state.protocol_map.max_supported_id(),
+                    snapshot.protocol_map.max_supported_id(),
                     cfg.status_timeout_ms,
-                    state.config.listener.max_packet_size,
+                    snapshot.config.listener.max_packet_size,
                 )
                 .await;
 
@@ -81,8 +79,10 @@ pub fn spawn_health_checker(state: RuntimeState) {
                     .metrics
                     .set_backend_health_state(backend.name(), new_state.encoded());
             }
-        });
-    }
+
+            tokio::time::sleep(Duration::from_millis(cfg.interval_ms)).await;
+        }
+    });
 }
 
 async fn probe_status(

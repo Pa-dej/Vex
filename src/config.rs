@@ -10,6 +10,7 @@ pub struct Config {
     pub listener: ListenerConfig,
     pub routing: RoutingConfig,
     pub auth: AuthConfig,
+    pub forwarding: ForwardingConfig,
     pub limits: LimitsConfig,
     pub health: HealthConfig,
     pub observability: ObservabilityConfig,
@@ -24,6 +25,7 @@ impl Default for Config {
             listener: ListenerConfig::default(),
             routing: RoutingConfig::default(),
             auth: AuthConfig::default(),
+            forwarding: ForwardingConfig::default(),
             limits: LimitsConfig::default(),
             health: HealthConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -113,6 +115,36 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             mode: AuthMode::Offline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ForwardingConfig {
+    pub velocity: VelocityForwardingConfig,
+}
+
+impl Default for ForwardingConfig {
+    fn default() -> Self {
+        Self {
+            velocity: VelocityForwardingConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VelocityForwardingConfig {
+    pub enabled: bool,
+    pub secret: String,
+}
+
+impl Default for VelocityForwardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: String::new(),
         }
     }
 }
