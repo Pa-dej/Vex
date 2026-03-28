@@ -153,22 +153,30 @@ impl Default for VelocityForwardingConfig {
 #[serde(default)]
 pub struct LimitsConfig {
     pub max_connections: usize,
+    pub max_connections_total: u32,
+    pub per_ip_rate_limit: u32,
+    pub per_subnet_rate_limit: u32,
     pub initial_buffer_bytes: usize,
     pub per_connection_cap_bytes: usize,
     pub global_memory_budget_bytes: usize,
     pub handshake_timeout_ms: u64,
     pub login_timeout_ms: u64,
+    pub max_packet_size: usize,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_connections: 100_000,
+            max_connections_total: 10_000,
+            per_ip_rate_limit: 20,
+            per_subnet_rate_limit: 50,
             initial_buffer_bytes: 1024,
             per_connection_cap_bytes: 64 * 1024,
             global_memory_budget_bytes: 2 * 1024 * 1024 * 1024,
             handshake_timeout_ms: 2_000,
             login_timeout_ms: 4_000,
+            max_packet_size: 8 * 1024 * 1024,
         }
     }
 }

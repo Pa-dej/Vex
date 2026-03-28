@@ -12,7 +12,7 @@ pub struct Metrics {
     backend_connect_errors_total: IntCounterVec,
     backend_latency_seconds: HistogramVec,
     backend_health_state: IntGaugeVec,
-    rejects_total: IntCounterVec,
+    connections_rejected_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -61,14 +61,14 @@ impl Metrics {
         )?;
         registry.register(Box::new(backend_health_state.clone()))?;
 
-        let rejects_total = IntCounterVec::new(
+        let connections_rejected_total = IntCounterVec::new(
             Opts::new(
-                "vex_rejects_total",
+                "vex_connections_rejected_total",
                 "Rejected client connections partitioned by reason",
             ),
             &["reason"],
         )?;
-        registry.register(Box::new(rejects_total.clone()))?;
+        registry.register(Box::new(connections_rejected_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -77,7 +77,7 @@ impl Metrics {
             backend_connect_errors_total,
             backend_latency_seconds,
             backend_health_state,
-            rejects_total,
+            connections_rejected_total,
         })
     }
 
@@ -114,7 +114,9 @@ impl Metrics {
     }
 
     pub fn inc_reject(&self, reason: &str) {
-        self.rejects_total.with_label_values(&[reason]).inc();
+        self.connections_rejected_total
+            .with_label_values(&[reason])
+            .inc();
     }
 
     pub fn gather_text(&self) -> Result<String> {

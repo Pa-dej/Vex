@@ -27,6 +27,19 @@ pub struct LoginPluginRequest {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EncryptionResponse {
+    pub shared_secret: Vec<u8>,
+    pub verify_token: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VelocityProperty {
+    pub name: String,
+    pub value: String,
+    pub signature: Option<String>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct LoginPluginResponse {
@@ -42,7 +55,7 @@ pub struct VelocityForwardingPayload {
     pub client_ip: String,
     pub uuid_bytes: [u8; 16],
     pub username: String,
-    pub properties_count: i32,
+    pub properties: Vec<VelocityProperty>,
 }
 
 pub async fn read_packet(stream: &mut TcpStream, max_packet_size: usize) -> io::Result<Vec<u8>> {
@@ -134,6 +147,58 @@ pub fn build_login_disconnect(message: &str) -> Vec<u8> {
     write_varint(0, &mut payload);
     write_mc_string(&chat_json, &mut payload);
     payload.to_vec()
+}
+
+pub fn build_encryption_request(
+    server_id: &str,
+    public_key_der: &[u8],
+    verify_token: &[u8],
+) -> Vec<u8> {
+    let mut payload =
+        BytesMut::with_capacity(server_id.len() + public_key_der.len() + verify_token.len() + 16);
+    write_varint(0x01, &mut payload);
+    write_mc_string(server_id, &mut payload);
+    write_byte_array(public_key_der, &mut payload);
+    write_byte_array(verify_token, &mut payload);
+    payload.put_u8(1); // should authenticate
+    payload.to_vec()
+}
+
+pub fn parse_encryption_response(payload: &[u8]) -> Result<Option<EncryptionResponse>> {
+    let (packet_id, mut offset) = parse_varint(payload).context("missing packet id")?;
+    if packet_id != 0x01 {
+        return Ok(None);
+    }
+
+    let (shared_secret, read) =
+        parse_byte_array(&payload[offset..]).context("missing encrypted shared secret")?;
+    offset += read;
+    if offset >= payload.len() {
+        bail!("missing encrypted verify token");
+    }
+
+    let remaining = &payload[offset..];
+    if let Ok((verify_token, read)) = parse_byte_array(remaining) {
+        if read == remaining.len() {
+            return Ok(Some(EncryptionResponse {
+                shared_secret,
+                verify_token,
+            }));
+        }
+    }
+
+    let has_verify_token = remaining[0] != 0;
+    offset += 1;
+    if !has_verify_token {
+        bail!("encryption response without verify token is not supported");
+    }
+
+    let (verify_token, _read) =
+        parse_byte_array(&payload[offset..]).context("missing encrypted verify token")?;
+    Ok(Some(EncryptionResponse {
+        shared_secret,
+        verify_token,
+    }))
 }
 
 #[cfg(test)]
@@ -276,13 +341,26 @@ pub fn parse_login_plugin_response(payload: &[u8]) -> Result<Option<LoginPluginR
     }))
 }
 
-pub fn build_velocity_modern_forwarding_payload(client_ip: &str, username: &str) -> Vec<u8> {
-    let mut payload = BytesMut::with_capacity(client_ip.len() + username.len() + 32);
+pub fn build_velocity_modern_forwarding_payload(
+    client_ip: &str,
+    uuid_bytes: [u8; 16],
+    username: &str,
+    properties: &[VelocityProperty],
+) -> Vec<u8> {
+    let mut payload = BytesMut::with_capacity(client_ip.len() + username.len() + 64);
     write_varint(1, &mut payload);
     write_mc_string(client_ip, &mut payload);
-    payload.put_slice(&offline_uuid(username));
+    payload.put_slice(&uuid_bytes);
     write_mc_string(username, &mut payload);
-    write_varint(0, &mut payload);
+    write_varint(properties.len() as i32, &mut payload);
+    for property in properties {
+        write_mc_string(&property.name, &mut payload);
+        write_mc_string(&property.value, &mut payload);
+        payload.put_u8(property.signature.is_some() as u8);
+        if let Some(signature) = &property.signature {
+            write_mc_string(signature, &mut payload);
+        }
+    }
     payload.to_vec()
 }
 
@@ -306,14 +384,44 @@ pub fn parse_velocity_modern_forwarding_payload(
     offset += 16;
     let (username, read) = parse_mc_string(&payload[offset..]).context("missing username")?;
     offset += read;
-    let (properties_count, _read) =
+    let (properties_count, read) =
         parse_varint(&payload[offset..]).context("missing properties count")?;
+    offset += read;
+    if properties_count < 0 {
+        bail!("negative properties count");
+    }
+    let mut properties = Vec::with_capacity(properties_count as usize);
+    for _ in 0..properties_count {
+        let (name, read) = parse_mc_string(&payload[offset..]).context("missing property name")?;
+        offset += read;
+        let (value, read) =
+            parse_mc_string(&payload[offset..]).context("missing property value")?;
+        offset += read;
+        if payload.len() <= offset {
+            bail!("missing property signature flag");
+        }
+        let has_signature = payload[offset] != 0;
+        offset += 1;
+        let signature = if has_signature {
+            let (signature, read) =
+                parse_mc_string(&payload[offset..]).context("missing property signature")?;
+            offset += read;
+            Some(signature)
+        } else {
+            None
+        };
+        properties.push(VelocityProperty {
+            name,
+            value,
+            signature,
+        });
+    }
     Ok(VelocityForwardingPayload {
         version,
         client_ip,
         uuid_bytes,
         username,
-        properties_count,
+        properties,
     })
 }
 
@@ -424,6 +532,25 @@ fn write_mc_string(value: &str, buf: &mut BytesMut) {
     buf.put_slice(value.as_bytes());
 }
 
+fn parse_byte_array(input: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let (len, read) = parse_varint(input).context("bad byte array len varint")?;
+    if len < 0 {
+        bail!("negative byte array len");
+    }
+    let len = len as usize;
+    let start = read;
+    let end = start + len;
+    if input.len() < end {
+        bail!("byte array payload truncated");
+    }
+    Ok((input[start..end].to_vec(), read + len))
+}
+
+fn write_byte_array(value: &[u8], buf: &mut BytesMut) {
+    write_varint(value.len() as i32, buf);
+    buf.put_slice(value);
+}
+
 async fn read_varint_async(stream: &mut TcpStream) -> io::Result<i32> {
     let mut num_read = 0u32;
     let mut result = 0i32;
@@ -471,7 +598,12 @@ mod tests {
 
     #[test]
     fn velocity_payload_signing_roundtrip() {
-        let payload = build_velocity_modern_forwarding_payload("127.0.0.1", "Player");
+        let payload = build_velocity_modern_forwarding_payload(
+            "127.0.0.1",
+            offline_uuid("Player"),
+            "Player",
+            &[],
+        );
         let signed = build_signed_velocity_forwarding_data("secret", &payload).expect("signing");
         assert_eq!(signed.len(), payload.len() + 32);
         let parsed = parse_velocity_modern_forwarding_payload(&signed[32..]).expect("parse");
@@ -479,7 +611,7 @@ mod tests {
         assert_eq!(parsed.client_ip, "127.0.0.1");
         assert_eq!(parsed.uuid_bytes, offline_uuid("Player"));
         assert_eq!(parsed.username, "Player");
-        assert_eq!(parsed.properties_count, 0);
+        assert!(parsed.properties.is_empty());
     }
 
     #[test]

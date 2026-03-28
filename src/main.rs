@@ -1,7 +1,10 @@
 mod admin;
+mod auth_circuit;
 mod backend;
 mod config;
+mod crypto;
 mod health;
+mod limiter;
 mod mc;
 mod memory;
 mod metrics;
@@ -43,7 +46,7 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::new()?);
     let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
 
-    let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends);
+    let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends)?;
 
     spawn_health_checker(state.clone());
 

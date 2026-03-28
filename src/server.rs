@@ -2,21 +2,31 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes::Aes128;
+use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use anyhow::{Result, bail};
+use rand::distributions::{Alphanumeric, DistString};
+use rand::{Rng, thread_rng};
+use serde::Deserialize;
 use serde_json::json;
-use tokio::io::copy_bidirectional;
+use sha1::{Digest, Sha1};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use crate::auth_circuit::CircuitState;
 use crate::config::AuthMode;
+use crate::limiter::AcquireRejectReason;
 use crate::mc::{
-    build_login_disconnect, build_login_plugin_response, build_signed_velocity_forwarding_data,
-    build_status_ping_response, build_status_response, build_velocity_modern_forwarding_payload,
-    decode_login_packet_from_backend, encode_login_packet_for_backend, parse_handshake,
-    parse_login_plugin_request, parse_login_start_username, parse_packet_id,
-    parse_set_compression_threshold, read_packet, write_packet,
+    EncryptionResponse, VelocityProperty, build_encryption_request, build_login_disconnect,
+    build_login_plugin_response, build_signed_velocity_forwarding_data, build_status_ping_response,
+    build_status_response, build_velocity_modern_forwarding_payload,
+    decode_login_packet_from_backend, encode_login_packet_for_backend, offline_uuid,
+    parse_encryption_response, parse_handshake, parse_login_plugin_request,
+    parse_login_start_username, parse_packet_id, parse_set_compression_threshold, parse_varint,
+    read_packet, write_packet, write_varint,
 };
 use crate::state::RuntimeState;
 
@@ -25,6 +35,7 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
     let bind_addr = snapshot.config.listener.bind.clone();
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("proxy listener on {}", bind_addr);
+    let _limiter_cleanup_task = state.limiter().spawn_cleanup_task();
 
     let mut shutdown_rx = state.shutdown.subscribe();
 
@@ -45,6 +56,36 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                     }
                 };
 
+                let limiter_lease = match state.limiter().try_acquire(addr.ip()) {
+                    Ok(lease) => lease,
+                    Err(AcquireRejectReason::GlobalCap) => {
+                        state.metrics.inc_reject("global_cap");
+                        let mut stream = stream;
+                        let _ = reject_without_handshake(&mut stream, "Server is full").await;
+                        continue;
+                    }
+                    Err(AcquireRejectReason::IpRateLimit) => {
+                        state.metrics.inc_reject("ip_rate_limit");
+                        let mut stream = stream;
+                        let _ = reject_without_handshake(
+                            &mut stream,
+                            "Too many connections from your address",
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(AcquireRejectReason::SubnetRateLimit) => {
+                        state.metrics.inc_reject("subnet_rate_limit");
+                        let mut stream = stream;
+                        let _ = reject_without_handshake(
+                            &mut stream,
+                            "Too many connections from your address",
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
                 let permit = match state.connection_slots().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -60,7 +101,9 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
 
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, addr, state_clone, permit).await {
+                    if let Err(err) =
+                        handle_connection(stream, addr, state_clone, permit, limiter_lease).await
+                    {
                         error!(peer = %addr, err = %format!("{err:#}"), "connection ended with error");
                     }
                 });
@@ -78,6 +121,7 @@ async fn handle_connection(
     peer: SocketAddr,
     state: RuntimeState,
     _permit: OwnedSemaphorePermit,
+    _limiter_lease: crate::limiter::ConnectionLease,
 ) -> Result<()> {
     state.metrics.inc_active_connections();
     let _active_guard = ActiveConnectionGuard {
@@ -101,12 +145,22 @@ async fn handle_connection(
     let handshake_timeout = Duration::from_millis(snapshot.config.limits.handshake_timeout_ms);
     let login_timeout = Duration::from_millis(snapshot.config.limits.login_timeout_ms);
 
-    let handshake_packet = timeout(
+    let handshake_packet = match timeout(
         handshake_timeout,
-        read_packet(&mut client, snapshot.config.listener.max_packet_size),
+        read_first_packet(&mut client, snapshot.config.limits.max_packet_size),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("handshake timeout"))??;
+    {
+        Ok(Ok(packet)) => packet,
+        Ok(Err(FirstFrameError::Malformed)) => {
+            state.metrics.inc_reject("malformed_frame");
+            return Ok(());
+        }
+        Ok(Err(FirstFrameError::Io(err))) => {
+            return Err(err.into());
+        }
+        Err(_) => return Err(anyhow::anyhow!("handshake timeout")),
+    };
 
     let handshake = parse_handshake(&handshake_packet)?;
     debug!(
@@ -153,7 +207,6 @@ async fn handle_connection(
                 &mut client,
                 &snapshot,
                 &state,
-                handshake_packet,
                 handshake.protocol_version,
                 login_timeout,
                 &client_ip,
@@ -164,6 +217,7 @@ async fn handle_connection(
                 error!("login error peer={} err={:#}", peer, e);
                 return Err(e);
             }
+            return Ok(());
         }
         _ => {
             state.metrics.inc_reject("bad_next_state");
@@ -175,13 +229,56 @@ async fn handle_connection(
     Ok(())
 }
 
+enum FirstFrameError {
+    Malformed,
+    Io(std::io::Error),
+}
+
+async fn read_first_packet(
+    stream: &mut TcpStream,
+    max_packet_size: usize,
+) -> std::result::Result<Vec<u8>, FirstFrameError> {
+    let mut num_read = 0usize;
+    let mut result = 0i32;
+    let mut shift = 0u32;
+
+    loop {
+        let byte = stream.read_u8().await.map_err(FirstFrameError::Io)?;
+        let value = (byte & 0x7F) as i32;
+        result |= value << shift;
+        num_read += 1;
+        if num_read > 5 {
+            return Err(FirstFrameError::Malformed);
+        }
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+    }
+
+    if result <= 0 {
+        return Err(FirstFrameError::Malformed);
+    }
+    let packet_len = result as usize;
+    if packet_len > max_packet_size {
+        return Err(FirstFrameError::Malformed);
+    }
+
+    let mut payload = vec![0u8; packet_len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(FirstFrameError::Io)?;
+    Ok(payload)
+}
+
 async fn handle_status(
     client: &mut TcpStream,
     snapshot: &Arc<crate::state::RuntimeSnapshot>,
     state: &RuntimeState,
     handshake: &crate::mc::Handshake,
 ) -> Result<()> {
-    let req = read_packet(client, snapshot.config.listener.max_packet_size).await?;
+    let req = read_packet(client, snapshot.config.limits.max_packet_size).await?;
     let (packet_id, _) = parse_packet_id(&req)?;
     if packet_id != 0 {
         bail!("unexpected status packet id {packet_id}");
@@ -213,7 +310,7 @@ async fn handle_status(
     let response = build_status_response(&status_json);
     write_packet(client, &response).await?;
 
-    if let Ok(ping_packet) = read_packet(client, snapshot.config.listener.max_packet_size).await {
+    if let Ok(ping_packet) = read_packet(client, snapshot.config.limits.max_packet_size).await {
         let (id, read) = parse_packet_id(&ping_packet)?;
         if id == 1 && ping_packet.len() >= read + 8 {
             let payload = i64::from_be_bytes(
@@ -232,41 +329,128 @@ async fn handle_login(
     client: &mut TcpStream,
     snapshot: &Arc<crate::state::RuntimeSnapshot>,
     state: &RuntimeState,
-    _handshake_packet: Vec<u8>,
     protocol_version: i32,
     login_timeout: Duration,
     client_ip: &str,
     peer: SocketAddr,
 ) -> Result<()> {
-    let auth_mode = state.auth_mode().await;
-    if !matches!(auth_mode, AuthMode::Offline) {
-        state.metrics.inc_reject("auth_mode_not_offline");
-        reject_with_reason(
-            client,
-            2,
-            "Online auth path is not enabled in v1 core. Set auth.mode=offline.",
-        )
-        .await?;
-        return Ok(());
-    }
-
     let login_start_packet = timeout(
         login_timeout,
-        read_packet(client, snapshot.config.listener.max_packet_size),
+        read_client_packet(client, snapshot.config.limits.max_packet_size, None),
     )
     .await
     .map_err(|_| anyhow::anyhow!("login start timeout"))??;
 
-    let username =
+    let login_start_username =
         parse_login_start_username(&login_start_packet)?.unwrap_or_else(|| "unknown".to_string());
-    debug!(username = %username, "incoming offline login");
+    debug!(username = %login_start_username, "incoming login start");
+
+    let auth_mode = state.auth_mode().await;
+    let mut client_crypto: Option<ClientCrypto> = None;
+    let identity = match auth_mode {
+        AuthMode::Offline => {
+            warn!(peer = %peer, "offline auth fallback is active for accepted connection");
+            AuthenticatedIdentity {
+                uuid_bytes: offline_uuid(&login_start_username),
+                username: login_start_username.clone(),
+                properties: Vec::new(),
+            }
+        }
+        AuthMode::Online | AuthMode::Auto => {
+            let server_id = random_ascii(20);
+            let mut verify_token = [0u8; 4];
+            thread_rng().fill(&mut verify_token);
+
+            let crypto = state.crypto();
+            let encryption_request =
+                build_encryption_request(&server_id, crypto.public_key_der(), &verify_token);
+            write_client_packet(client, &encryption_request, None).await?;
+
+            let encryption_response_packet = timeout(
+                login_timeout,
+                read_client_packet(client, snapshot.config.limits.max_packet_size, None),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("encryption response timeout"))??;
+
+            let EncryptionResponse {
+                shared_secret,
+                verify_token: encrypted_verify_token,
+            } = parse_encryption_response(&encryption_response_packet)?
+                .ok_or_else(|| anyhow::anyhow!("expected encryption response packet id 0x01"))?;
+
+            let decrypted_secret = crypto.decrypt(&shared_secret)?;
+            if decrypted_secret.len() != 16 {
+                send_login_disconnect_best_effort(client, "Invalid shared secret", None).await?;
+                return Ok(());
+            }
+            let decrypted_verify_token = crypto.decrypt(&encrypted_verify_token)?;
+            if decrypted_verify_token.as_slice() != verify_token {
+                send_login_disconnect_best_effort(client, "Invalid verify token", None).await?;
+                return Ok(());
+            }
+
+            let shared_secret: [u8; 16] = decrypted_secret
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("shared secret must be 16 bytes"))?;
+            client_crypto = Some(ClientCrypto::new(&shared_secret)?);
+
+            let server_hash =
+                compute_minecraft_server_hash(&server_id, &shared_secret, crypto.public_key_der());
+            let profile = match authenticate_online(
+                state,
+                &login_start_username,
+                &server_hash,
+                login_timeout,
+            )
+            .await
+            {
+                Ok(profile) => profile,
+                Err(MojangAuthError::AuthenticationFailed) => {
+                    send_login_disconnect_best_effort(
+                        client,
+                        "Authentication failed",
+                        client_crypto.as_mut(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(MojangAuthError::ServiceUnavailable) => {
+                    send_login_disconnect_best_effort(
+                        client,
+                        "Authentication service unavailable. Try again later.",
+                        client_crypto.as_mut(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            let uuid_bytes = parse_mojang_uuid_bytes(&profile.id)?;
+            let properties = profile
+                .properties
+                .into_iter()
+                .map(|property| VelocityProperty {
+                    name: property.name,
+                    value: property.value,
+                    signature: property.signature,
+                })
+                .collect::<Vec<_>>();
+            AuthenticatedIdentity {
+                uuid_bytes,
+                username: profile.name,
+                properties,
+            }
+        }
+    };
 
     let Some(lease) = snapshot.backends.choose_backend() else {
         state.metrics.inc_reject("no_healthy_backend");
-        reject_with_reason(
+        send_login_disconnect_best_effort(
             client,
-            2,
             "No healthy backend available. Try again in a few seconds.",
+            client_crypto.as_mut(),
         )
         .await?;
         return Ok(());
@@ -280,14 +464,24 @@ async fn handle_login(
                 state
                     .metrics
                     .inc_backend_error(backend.name(), "connect_error");
-                reject_with_reason(client, 2, "Failed to connect backend").await?;
+                send_login_disconnect_best_effort(
+                    client,
+                    "Failed to connect backend",
+                    client_crypto.as_mut(),
+                )
+                .await?;
                 return Err(anyhow::anyhow!("backend connect error: {err}"));
             }
             Err(_) => {
                 state
                     .metrics
                     .inc_backend_error(backend.name(), "connect_timeout");
-                reject_with_reason(client, 2, "Backend connection timeout").await?;
+                send_login_disconnect_best_effort(
+                    client,
+                    "Backend connection timeout",
+                    client_crypto.as_mut(),
+                )
+                .await?;
                 return Err(anyhow::anyhow!("backend connect timeout"));
             }
         };
@@ -302,10 +496,11 @@ async fn handle_login(
         tracing::debug!("entering velocity intercept loop peer={}", peer);
         let login_phase = run_velocity_login_intercept(
             client,
+            client_crypto.as_mut(),
             &mut backend_stream,
-            snapshot.config.listener.max_packet_size,
+            snapshot.config.limits.max_packet_size,
             client_ip,
-            &username,
+            &identity,
             &snapshot.config.forwarding.velocity.secret,
             peer,
         )
@@ -317,10 +512,11 @@ async fn handle_login(
 
     let mut shutdown_rx = state.shutdown.subscribe();
     let shutdown_message = snapshot.config.shutdown.disconnect_message.clone();
-    let max_packet = snapshot.config.listener.max_packet_size;
 
     let mut shutdown_requested = false;
-    {
+    if let Some(crypto) = client_crypto {
+        relay_with_encrypted_client(client, &mut backend_stream, crypto, &mut shutdown_rx).await?;
+    } else {
         let relay = copy_bidirectional(client, &mut backend_stream);
         tokio::pin!(relay);
         tokio::select! {
@@ -333,9 +529,10 @@ async fn handle_login(
                 }
             }
         }
-    };
+    }
+
     if shutdown_requested {
-        let _ = send_login_disconnect_best_effort(client, &shutdown_message, max_packet).await;
+        let _ = send_login_disconnect_best_effort(client, &shutdown_message, None).await;
     }
 
     Ok(())
@@ -347,16 +544,118 @@ enum LoginPhaseOutcome {
     Terminated,
 }
 
+struct ClientCrypto {
+    encryptor: Cfb8Encryptor,
+    decryptor: Cfb8Decryptor,
+}
+
+impl ClientCrypto {
+    fn new(shared_secret: &[u8; 16]) -> Result<Self> {
+        let encryptor = Cfb8Encryptor::new(shared_secret, shared_secret)
+            .map_err(|_| anyhow::anyhow!("failed to initialize client encryptor"))?;
+        let decryptor = Cfb8Decryptor::new(shared_secret, shared_secret)
+            .map_err(|_| anyhow::anyhow!("failed to initialize client decryptor"))?;
+        Ok(Self {
+            encryptor,
+            decryptor,
+        })
+    }
+}
+
+struct Cfb8Encryptor {
+    cipher: Aes128,
+    register: [u8; 16],
+}
+
+impl Cfb8Encryptor {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> anyhow::Result<Self> {
+        let cipher = Aes128::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid AES key"))?;
+        Ok(Self {
+            cipher,
+            register: *iv,
+        })
+    }
+
+    fn encrypt(&mut self, buf: &mut [u8]) {
+        for byte in buf {
+            let mut block = GenericArray::clone_from_slice(&self.register);
+            self.cipher.encrypt_block(&mut block);
+            let ciphertext = *byte ^ block[0];
+            self.register.copy_within(1.., 0);
+            self.register[15] = ciphertext;
+            *byte = ciphertext;
+        }
+    }
+}
+
+struct Cfb8Decryptor {
+    cipher: Aes128,
+    register: [u8; 16],
+}
+
+impl Cfb8Decryptor {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> anyhow::Result<Self> {
+        let cipher = Aes128::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid AES key"))?;
+        Ok(Self {
+            cipher,
+            register: *iv,
+        })
+    }
+
+    fn decrypt(&mut self, buf: &mut [u8]) {
+        for byte in buf {
+            let ciphertext = *byte;
+            let mut block = GenericArray::clone_from_slice(&self.register);
+            self.cipher.encrypt_block(&mut block);
+            let plaintext = ciphertext ^ block[0];
+            self.register.copy_within(1.., 0);
+            self.register[15] = ciphertext;
+            *byte = plaintext;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedIdentity {
+    uuid_bytes: [u8; 16],
+    username: String,
+    properties: Vec<VelocityProperty>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MojangHasJoinedProfile {
+    id: String,
+    name: String,
+    #[serde(default)]
+    properties: Vec<MojangProperty>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MojangProperty {
+    name: String,
+    value: String,
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MojangAuthError {
+    AuthenticationFailed,
+    ServiceUnavailable,
+}
+
 async fn run_velocity_login_intercept(
     client: &mut TcpStream,
+    client_crypto: Option<&mut ClientCrypto>,
     backend: &mut TcpStream,
     max_packet_size: usize,
     client_ip: &str,
-    username: &str,
+    identity: &AuthenticatedIdentity,
     secret: &str,
     peer: SocketAddr,
 ) -> Result<LoginPhaseOutcome> {
     let mut compression_threshold: Option<i32> = None;
+    let mut client_crypto = client_crypto;
     loop {
         let raw_packet = read_packet(backend, max_packet_size).await?;
         let packet =
@@ -379,7 +678,8 @@ async fn run_velocity_login_intercept(
                     threshold,
                     peer
                 );
-                write_packet(client, &raw_packet).await?;
+                let crypto = client_crypto.as_mut().map(|inner| &mut **inner);
+                write_client_packet(client, &raw_packet, crypto).await?;
                 continue;
             }
             0x04 => {
@@ -388,7 +688,12 @@ async fn run_velocity_login_intercept(
                 };
                 let _request_data_len = request.data.len();
                 if request.channel == "velocity:player_info" {
-                    let payload = build_velocity_modern_forwarding_payload(client_ip, username);
+                    let payload = build_velocity_modern_forwarding_payload(
+                        client_ip,
+                        identity.uuid_bytes,
+                        &identity.username,
+                        &identity.properties,
+                    );
                     let signed = build_signed_velocity_forwarding_data(secret, &payload)?;
                     let response =
                         build_login_plugin_response(request.message_id, true, Some(&signed));
@@ -405,11 +710,13 @@ async fn run_velocity_login_intercept(
             }
             0x02 => {
                 tracing::debug!("received login success from backend peer={}", peer);
-                write_packet(client, &raw_packet).await?;
+                let crypto = client_crypto.as_mut().map(|inner| &mut **inner);
+                write_client_packet(client, &raw_packet, crypto).await?;
                 return Ok(LoginPhaseOutcome::ContinueToRelay);
             }
             0x00 => {
-                write_packet(client, &raw_packet).await?;
+                let crypto = client_crypto.as_mut().map(|inner| &mut **inner);
+                write_client_packet(client, &raw_packet, crypto).await?;
                 return Ok(LoginPhaseOutcome::Terminated);
             }
             _ => {
@@ -417,7 +724,8 @@ async fn run_velocity_login_intercept(
                     "unexpected backend packet id={:#04x} peer={}",
                     packet_id, peer
                 );
-                write_packet(client, &raw_packet).await?;
+                let crypto = client_crypto.as_mut().map(|inner| &mut **inner);
+                write_client_packet(client, &raw_packet, crypto).await?;
             }
         }
     }
@@ -426,10 +734,258 @@ async fn run_velocity_login_intercept(
 async fn send_login_disconnect_best_effort(
     stream: &mut TcpStream,
     message: &str,
-    _max_packet: usize,
+    client_crypto: Option<&mut ClientCrypto>,
 ) -> Result<()> {
     let payload = build_login_disconnect(message);
-    let _ = write_packet(stream, &payload).await;
+    let _ = write_client_packet(stream, &payload, client_crypto).await;
+    Ok(())
+}
+
+async fn authenticate_online(
+    state: &RuntimeState,
+    username: &str,
+    server_hash: &str,
+    _login_timeout: Duration,
+) -> Result<MojangHasJoinedProfile, MojangAuthError> {
+    let circuit = state.auth_circuit();
+    if !circuit.allow_request() {
+        return Err(MojangAuthError::ServiceUnavailable);
+    }
+
+    let client = state.mojang_client();
+    let base_url = state.mojang_session_base_url();
+    match request_mojang_profile(client.as_ref(), base_url.as_str(), username, server_hash).await {
+        Ok(profile) => {
+            circuit.record_success();
+            Ok(profile)
+        }
+        Err(MojangAuthError::AuthenticationFailed) => {
+            circuit.record_success();
+            Err(MojangAuthError::AuthenticationFailed)
+        }
+        Err(MojangAuthError::ServiceUnavailable) => {
+            circuit.record_failure();
+            if circuit.state() == CircuitState::Open {
+                warn!("mojang auth circuit opened after failure");
+            }
+            Err(MojangAuthError::ServiceUnavailable)
+        }
+    }
+}
+
+async fn request_mojang_profile(
+    client: &reqwest::Client,
+    base_url: &str,
+    username: &str,
+    server_hash: &str,
+) -> Result<MojangHasJoinedProfile, MojangAuthError> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let url = format!("{base_url}/session/minecraft/hasJoined");
+        let response = client
+            .get(url)
+            .query(&[("username", username), ("serverId", server_hash)])
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status() == reqwest::StatusCode::OK => {
+                let profile = resp
+                    .json::<MojangHasJoinedProfile>()
+                    .await
+                    .map_err(|_| MojangAuthError::ServiceUnavailable)?;
+                return Ok(profile);
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NO_CONTENT => {
+                return Err(MojangAuthError::AuthenticationFailed);
+            }
+            Ok(resp) if resp.status().is_client_error() => {
+                return Err(MojangAuthError::AuthenticationFailed);
+            }
+            Ok(resp) if resp.status().is_server_error() => {
+                if attempt < 2 {
+                    jitter_sleep().await;
+                    continue;
+                }
+                return Err(MojangAuthError::ServiceUnavailable);
+            }
+            Ok(_) => {
+                return Err(MojangAuthError::AuthenticationFailed);
+            }
+            Err(_) => {
+                if attempt < 2 {
+                    jitter_sleep().await;
+                    continue;
+                }
+                return Err(MojangAuthError::ServiceUnavailable);
+            }
+        }
+    }
+}
+
+async fn jitter_sleep() {
+    let millis = thread_rng().gen_range(100..=300);
+    tokio::time::sleep(Duration::from_millis(millis)).await;
+}
+
+fn random_ascii(len: usize) -> String {
+    Alphanumeric.sample_string(&mut thread_rng(), len)
+}
+
+fn compute_minecraft_server_hash(
+    server_id: &str,
+    shared_secret: &[u8],
+    public_key_der: &[u8],
+) -> String {
+    let mut sha = Sha1::new();
+    sha.update(server_id.as_bytes());
+    sha.update(shared_secret);
+    sha.update(public_key_der);
+    let digest: [u8; 20] = sha.finalize().into();
+    minecraft_signed_hex_digest(&digest)
+}
+
+fn minecraft_signed_hex_digest(digest: &[u8; 20]) -> String {
+    let mut signed_bytes = digest.to_vec();
+    let negative = (signed_bytes[0] & 0x80) != 0;
+    if negative {
+        for byte in &mut signed_bytes {
+            *byte = !*byte;
+        }
+        let mut carry = true;
+        for byte in signed_bytes.iter_mut().rev() {
+            if carry {
+                let (next, overflow) = byte.overflowing_add(1);
+                *byte = next;
+                carry = overflow;
+            }
+        }
+    }
+
+    let mut first_non_zero = 0usize;
+    while first_non_zero < signed_bytes.len() && signed_bytes[first_non_zero] == 0 {
+        first_non_zero += 1;
+    }
+    let mut hex = String::new();
+    if first_non_zero == signed_bytes.len() {
+        hex.push('0');
+    } else {
+        for byte in &signed_bytes[first_non_zero..] {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+        }
+    }
+
+    if negative { format!("-{hex}") } else { hex }
+}
+
+fn parse_mojang_uuid_bytes(id: &str) -> Result<[u8; 16]> {
+    if id.len() != 32 {
+        bail!("mojang uuid id must be 32 hex chars");
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        let chunk = &id[i * 2..i * 2 + 2];
+        out[i] = u8::from_str_radix(chunk, 16)
+            .map_err(|_| anyhow::anyhow!("invalid mojang uuid hex"))?;
+    }
+    Ok(out)
+}
+
+async fn read_client_packet(
+    client: &mut TcpStream,
+    max_packet_size: usize,
+    client_crypto: Option<&mut ClientCrypto>,
+) -> Result<Vec<u8>> {
+    let Some(client_crypto) = client_crypto else {
+        return Ok(read_packet(client, max_packet_size).await?);
+    };
+
+    let mut raw_len = Vec::with_capacity(5);
+    loop {
+        let mut encrypted_byte = [0u8; 1];
+        client.read_exact(&mut encrypted_byte).await?;
+        (&mut client_crypto.decryptor).decrypt(&mut encrypted_byte);
+        raw_len.push(encrypted_byte[0]);
+        if encrypted_byte[0] & 0x80 == 0 {
+            break;
+        }
+        if raw_len.len() > 5 {
+            bail!("bad varint header");
+        }
+    }
+    let (packet_len, _) = parse_varint(&raw_len)?;
+    if packet_len <= 0 {
+        bail!("packet length must be positive");
+    }
+    let packet_len = packet_len as usize;
+    if packet_len > max_packet_size {
+        bail!("packet too large");
+    }
+
+    let mut payload = vec![0u8; packet_len];
+    client.read_exact(&mut payload).await?;
+    (&mut client_crypto.decryptor).decrypt(&mut payload);
+    Ok(payload)
+}
+
+async fn write_client_packet(
+    client: &mut TcpStream,
+    payload: &[u8],
+    client_crypto: Option<&mut ClientCrypto>,
+) -> Result<()> {
+    let Some(client_crypto) = client_crypto else {
+        write_packet(client, payload).await?;
+        return Ok(());
+    };
+
+    let mut header = bytes::BytesMut::with_capacity(5);
+    write_varint(payload.len() as i32, &mut header);
+    let mut frame = Vec::with_capacity(header.len() + payload.len());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(payload);
+    (&mut client_crypto.encryptor).encrypt(&mut frame);
+    client.write_all(&frame).await?;
+    Ok(())
+}
+
+async fn relay_with_encrypted_client(
+    client: &mut TcpStream,
+    backend: &mut TcpStream,
+    mut client_crypto: ClientCrypto,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()> {
+    let (mut client_reader, mut client_writer) = client.split();
+    let (mut backend_reader, mut backend_writer) = backend.split();
+    let mut client_to_backend = vec![0u8; 16 * 1024];
+    let mut backend_to_client = vec![0u8; 16 * 1024];
+
+    loop {
+        tokio::select! {
+            read = client_reader.read(&mut client_to_backend) => {
+                let n = read?;
+                if n == 0 {
+                    break;
+                }
+                (&mut client_crypto.decryptor).decrypt(&mut client_to_backend[..n]);
+                backend_writer.write_all(&client_to_backend[..n]).await?;
+            }
+            read = backend_reader.read(&mut backend_to_client) => {
+                let n = read?;
+                if n == 0 {
+                    break;
+                }
+                (&mut client_crypto.encryptor).encrypt(&mut backend_to_client[..n]);
+                client_writer.write_all(&backend_to_client[..n]).await?;
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && shutdown_rx.borrow().is_some() {
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -495,8 +1051,11 @@ mod tests {
     use bytes::BytesMut;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{sleep, timeout};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::auth_circuit::AuthCircuitBreaker;
     use crate::backend::BackendPool;
     use crate::config::{BackendConfig, Config};
     use crate::mc::{
@@ -508,6 +1067,106 @@ mod tests {
     use crate::metrics::Metrics;
     use crate::protocol_map::ProtocolMap;
     use crate::state::RuntimeState;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn minecraft_hash_matches_known_notch_vector() {
+        let mut sha = Sha1::new();
+        sha.update(b"Notch");
+        let digest: [u8; 20] = sha.finalize().into();
+        assert_eq!(
+            minecraft_signed_hex_digest(&digest),
+            "4ed1f46bbe04bc756bcb17c0c7ce3e4632f06a48"
+        );
+    }
+
+    #[test]
+    fn parse_mojang_uuid_hyphenless_id() {
+        let id = "069a79f444e94726a5befca90e38aaf5";
+        let parsed = parse_mojang_uuid_bytes(id).expect("must parse uuid bytes");
+        let expected = *Uuid::parse_str("069a79f4-44e9-4726-a5be-fca90e38aaf5")
+            .expect("uuid parse")
+            .as_bytes();
+        assert_eq!(parsed, expected);
+    }
+
+    #[tokio::test]
+    async fn mojang_mock_200_allows_authentication() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/session/minecraft/hasJoined"))
+            .and(query_param("username", "Player"))
+            .and(query_param("serverId", "hash"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "069a79f444e94726a5befca90e38aaf5",
+                "name": "Player",
+                "properties": [{
+                    "name": "textures",
+                    "value": "base64-texture",
+                    "signature": "signed"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .timeout(Duration::from_secs(1))
+            .build()?;
+        let profile = request_mojang_profile(&client, &server.uri(), "Player", "hash")
+            .await
+            .expect("profile should be returned");
+        assert_eq!(profile.name, "Player");
+        assert_eq!(profile.id, "069a79f444e94726a5befca90e38aaf5");
+        assert_eq!(profile.properties.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mojang_mock_204_rejects_authentication() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/session/minecraft/hasJoined"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .timeout(Duration::from_secs(1))
+            .build()?;
+        let result = request_mojang_profile(&client, &server.uri(), "Player", "hash").await;
+        assert_eq!(result.unwrap_err(), MojangAuthError::AuthenticationFailed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mojang_timeouts_open_circuit_after_three_failures() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/session/minecraft/hasJoined"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(250)))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(80))
+            .build()?;
+        let circuit = AuthCircuitBreaker::new(3, Duration::from_secs(30));
+
+        for _ in 0..3 {
+            assert!(circuit.allow_request());
+            let result = request_mojang_profile(&client, &server.uri(), "Player", "hash").await;
+            assert_eq!(result.unwrap_err(), MojangAuthError::ServiceUnavailable);
+            circuit.record_failure();
+        }
+
+        assert_eq!(circuit.state(), CircuitState::Open);
+        assert!(!circuit.allow_request());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn velocity_forwarding_login_plugin_is_signed() -> Result<()> {
@@ -532,7 +1191,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let pool = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config.clone(), protocol_map, metrics, pool);
+        let state = RuntimeState::new(config.clone(), protocol_map, metrics, pool)?;
 
         let server_state = state.clone();
         let server_task = tokio::spawn(async move { run_proxy_server(server_state).await });
@@ -581,11 +1240,8 @@ mod tests {
             if forwarded.username != "TestUser" {
                 bail!("unexpected forwarded username {}", forwarded.username);
             }
-            if forwarded.properties_count != 0 {
-                bail!(
-                    "expected zero properties, got {}",
-                    forwarded.properties_count
-                );
+            if !forwarded.properties.is_empty() {
+                bail!("expected zero properties");
             }
 
             let mut set_compression = BytesMut::new();

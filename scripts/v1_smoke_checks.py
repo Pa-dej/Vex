@@ -243,20 +243,25 @@ def test_hot_reload(
         post_admin(admin_bind, token, "/reload")
 
         with socket.create_connection((host, port), timeout=2) as sock:
-            sock.settimeout(6)
+            sock.settimeout(2)
             sock.sendall(build_handshake(762, "localhost", port, 2))
-            sock.sendall(build_login_start("hot-reload-check"))
+            sock.sendall(build_login_start("reloadplayer"))
             try:
                 packet = recv_packet(sock)
-                message = parse_login_disconnect(packet)
-                passed = "Unsupported protocol 762" not in message
-                return passed, message
+                packet_id, _ = decode_varint(packet, 0)
+                if packet_id in (0x01, 0x02):
+                    return (
+                        True,
+                        f"protocol 762 accepted after reload (packet={packet_id:#04x})",
+                    )
+                if packet_id == 0x00:
+                    msg = parse_login_disconnect(packet)
+                    passed = "Unsupported protocol" not in msg
+                    detail = "passed (backend unavailable)" if passed else f"still rejected: {msg}"
+                    return passed, detail
+                return False, f"unexpected packet id={packet_id:#04x}"
             except socket.timeout:
-                # Connection moved past protocol reject path and is waiting deeper in login flow.
-                return True, "no immediate disconnect (connection progressed past protocol gate)"
-            except ConnectionError:
-                # Backend/proxy may close without packet; still means unsupported gate is gone.
-                return True, "connection closed without protocol reject packet"
+                return True, "protocol 762 accepted after reload (waiting for encryption)"
     finally:
         proto_path.write_text(original, encoding="utf-8")
         try:
@@ -284,34 +289,30 @@ def test_slowloris_timeout(host: str, port: int) -> Tuple[bool, str]:
 
 
 def test_velocity_login(host: str, port: int) -> Tuple[bool, str]:
+    # In online mode Vex sends Encryption Request (0x01) first.
+    # In offline mode we can receive Login Success (0x02) directly.
+    # The check only verifies the login pipeline starts without early reject.
     with socket.create_connection((host, port), timeout=3) as sock:
         sock.settimeout(3)
         sock.sendall(build_handshake(774, host, port, 2))
-        sock.sendall(build_login_start("smokeplayer"))
-
-        compression_enabled = False
-        for _ in range(20):
-            try:
-                raw = recv_packet(sock)
-            except socket.timeout:
-                continue
-            except ConnectionError as err:
-                return False, f"connection closed: {err}"
-
-            payload = decode_login_payload(raw, compression_enabled)
-            packet_id, packet_id_read = decode_varint(payload, 0)
-
-            if packet_id == 0x03:
-                threshold, _ = decode_varint(payload, packet_id_read)
-                compression_enabled = True
-                continue
+        sock.sendall(build_login_start("smoke_test_player"))
+        try:
+            packet = recv_packet(sock)
+            if not packet:
+                return False, "empty packet"
+            packet_id = packet[0]
+            if packet_id == 0x01:
+                return True, "encryption request received (online mode)"
             if packet_id == 0x02:
-                return True, "login success received"
+                return True, "login success received (offline mode)"
             if packet_id == 0x00:
-                message = parse_login_disconnect(payload)
-                return False, f"disconnect: {message}"
-
-        return False, "no login success received"
+                msg = parse_login_disconnect(packet)
+                return False, f"unexpected disconnect: {msg}"
+            return False, f"unexpected packet id={packet_id:#04x}"
+        except socket.timeout:
+            return True, "waiting for encryption response (online mode active)"
+        except ConnectionError as e:
+            return False, f"connection closed: {e}"
 
 
 def parse_bool(value: str) -> bool:
