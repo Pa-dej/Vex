@@ -12,13 +12,13 @@ mod protocol_map;
 mod server;
 mod shutdown;
 mod state;
+mod telemetry;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 use crate::admin::{AdminContext, run_admin_server};
 use crate::backend::BackendPool;
@@ -28,12 +28,16 @@ use crate::metrics::Metrics;
 use crate::protocol_map::ProtocolMap;
 use crate::server::run_proxy_server;
 use crate::state::RuntimeState;
+use crate::telemetry::init_tracing;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = PathBuf::from("vex.toml");
     let config = Config::load_or_default(&config_path)?;
-    init_tracing(&config.observability.log_level);
+    init_tracing(
+        &config.observability.log_level,
+        config.observability.log_format,
+    );
 
     let protocol_map_path = PathBuf::from(&config.protocol_map.path);
     let protocol_map = ProtocolMap::load(&protocol_map_path).with_context(|| {
@@ -44,6 +48,10 @@ async fn main() -> Result<()> {
     })?;
 
     let metrics = Arc::new(Metrics::new()?);
+    metrics.spawn_runtime_sampler();
+    for version in protocol_map.versions().keys() {
+        metrics.init_protocol_version_label(version);
+    }
     let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
 
     let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends)?;
@@ -72,13 +80,4 @@ async fn main() -> Result<()> {
     });
 
     run_proxy_server(state).await
-}
-
-fn init_tracing(default_level: &str) {
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| default_level.to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(filter))
-        .with_target(false)
-        .compact()
-        .init();
 }

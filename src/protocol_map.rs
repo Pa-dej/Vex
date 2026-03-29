@@ -45,6 +45,12 @@ impl ProtocolMap {
     pub fn versions(&self) -> &BTreeMap<String, i32> {
         &self.version_to_id
     }
+
+    pub fn version_label_for_id(&self, protocol_id: i32) -> Option<&str> {
+        self.version_to_id
+            .iter()
+            .find_map(|(version, id)| (*id == protocol_id).then_some(version.as_str()))
+    }
 }
 
 #[derive(Debug, Deserialize)]

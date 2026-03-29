@@ -130,6 +130,7 @@ impl BackendPool {
         let mut backends = Vec::with_capacity(routing.backends.len());
         for cfg in &routing.backends {
             let backend = Arc::new(Backend::from_config(cfg)?);
+            metrics.init_backend_labels(backend.name());
             metrics.set_backend_health_state(backend.name(), BackendHealth::Healthy.encoded());
             metrics.set_backend_inflight(backend.name(), 0);
             backends.push(backend);

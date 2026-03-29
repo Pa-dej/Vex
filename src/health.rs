@@ -20,6 +20,7 @@ pub fn spawn_health_checker(state: RuntimeState) {
             let cfg = snapshot.config.health.clone();
 
             for backend in snapshot.backends.backends() {
+                let previous_state = backend.health();
                 let status_probe = probe_status(
                     backend.address(),
                     snapshot.protocol_map.max_supported_id(),
@@ -75,6 +76,11 @@ pub fn spawn_health_checker(state: RuntimeState) {
                     cfg.unhealthy_fail_threshold,
                     cfg.recovery_success_threshold,
                 );
+                if previous_state == crate::backend::BackendHealth::Unhealthy
+                    && new_state == crate::backend::BackendHealth::Healthy
+                {
+                    state.metrics.inc_backend_reconnect(backend.name());
+                }
                 state
                     .metrics
                     .set_backend_health_state(backend.name(), new_state.encoded());

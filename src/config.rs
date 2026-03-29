@@ -207,14 +207,23 @@ impl Default for HealthConfig {
 #[serde(default)]
 pub struct ObservabilityConfig {
     pub log_level: String,
+    pub log_format: LogFormat,
 }
 
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             log_level: "info".to_string(),
+            log_format: LogFormat::Pretty,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Pretty,
+    Json,
 }
 
 #[derive(Debug, Clone, Deserialize)]

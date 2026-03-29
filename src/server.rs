@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aes::Aes128;
 use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::auth_circuit::CircuitState;
 use crate::config::AuthMode;
@@ -29,6 +29,7 @@ use crate::mc::{
     read_packet, write_packet, write_varint,
 };
 use crate::state::RuntimeState;
+use crate::telemetry::generate_trace_id;
 
 pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
     let snapshot = state.snapshot();
@@ -55,17 +56,28 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                         continue;
                     }
                 };
+                let accepted_at = Instant::now();
 
                 let limiter_lease = match state.limiter().try_acquire(addr.ip()) {
                     Ok(lease) => lease,
                     Err(AcquireRejectReason::GlobalCap) => {
                         state.metrics.inc_reject("global_cap");
+                        state.metrics.inc_ratelimit_hit("global");
+                        state.metrics.inc_connection_result("reject");
+                        state
+                            .metrics
+                            .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
                         let mut stream = stream;
                         let _ = reject_without_handshake(&mut stream, "Server is full").await;
                         continue;
                     }
                     Err(AcquireRejectReason::IpRateLimit) => {
                         state.metrics.inc_reject("ip_rate_limit");
+                        state.metrics.inc_ratelimit_hit("ip");
+                        state.metrics.inc_connection_result("reject");
+                        state
+                            .metrics
+                            .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
                         let mut stream = stream;
                         let _ = reject_without_handshake(
                             &mut stream,
@@ -76,6 +88,11 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                     }
                     Err(AcquireRejectReason::SubnetRateLimit) => {
                         state.metrics.inc_reject("subnet_rate_limit");
+                        state.metrics.inc_ratelimit_hit("subnet");
+                        state.metrics.inc_connection_result("reject");
+                        state
+                            .metrics
+                            .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
                         let mut stream = stream;
                         let _ = reject_without_handshake(
                             &mut stream,
@@ -90,6 +107,10 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                     Ok(permit) => permit,
                     Err(_) => {
                         state.metrics.inc_reject("max_connections");
+                        state.metrics.inc_connection_result("reject");
+                        state
+                            .metrics
+                            .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
                         let mut stream = stream;
                         let _ = reject_without_handshake(
                             &mut stream,
@@ -100,13 +121,28 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                 };
 
                 let state_clone = state.clone();
+                let trace_id = generate_trace_id();
+                let connection_span = info_span!(
+                    "client_connection",
+                    trace_id = %trace_id,
+                    peer = %addr
+                );
                 tokio::spawn(async move {
                     if let Err(err) =
-                        handle_connection(stream, addr, state_clone, permit, limiter_lease).await
+                        handle_connection(
+                            stream,
+                            addr,
+                            accepted_at,
+                            state_clone,
+                            permit,
+                            limiter_lease,
+                        )
+                        .await
                     {
                         error!(peer = %addr, err = %format!("{err:#}"), "connection ended with error");
                     }
-                });
+                }
+                .instrument(connection_span));
             }
         }
     }
@@ -119,114 +155,153 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
 async fn handle_connection(
     mut client: TcpStream,
     peer: SocketAddr,
+    accepted_at: Instant,
     state: RuntimeState,
     _permit: OwnedSemaphorePermit,
     _limiter_lease: crate::limiter::ConnectionLease,
 ) -> Result<()> {
     state.metrics.inc_active_connections();
+    state.metrics.observe_reputation_score(100.0);
     let _active_guard = ActiveConnectionGuard {
         state: state.clone(),
     };
     let snapshot = state.snapshot();
-
-    let mut conn_mem = match state
-        .memory_budget()
-        .acquire_connection(snapshot.config.limits.initial_buffer_bytes)
-    {
-        Ok(mem) => mem,
-        Err(_) => {
-            state.metrics.inc_reject("memory_budget");
-            reject_without_handshake(&mut client, "Proxy memory budget exceeded").await?;
-            return Ok(());
-        }
-    };
-    conn_mem.reserve_for(snapshot.config.limits.initial_buffer_bytes)?;
-
-    let handshake_timeout = Duration::from_millis(snapshot.config.limits.handshake_timeout_ms);
-    let login_timeout = Duration::from_millis(snapshot.config.limits.login_timeout_ms);
-
-    let handshake_packet = match timeout(
-        handshake_timeout,
-        read_first_packet(&mut client, snapshot.config.limits.max_packet_size),
-    )
-    .await
-    {
-        Ok(Ok(packet)) => packet,
-        Ok(Err(FirstFrameError::Malformed)) => {
-            state.metrics.inc_reject("malformed_frame");
-            return Ok(());
-        }
-        Ok(Err(FirstFrameError::Io(err))) => {
-            return Err(err.into());
-        }
-        Err(_) => return Err(anyhow::anyhow!("handshake timeout")),
-    };
-
-    let handshake = parse_handshake(&handshake_packet)?;
-    debug!(
-        peer = %peer,
-        host = %handshake.server_address,
-        port = handshake.server_port,
-        protocol = handshake.protocol_version,
-        next_state = handshake.next_state,
-        "received handshake"
-    );
-
-    if !snapshot
-        .protocol_map
-        .is_supported(handshake.protocol_version)
-    {
-        state.metrics.inc_reject("unsupported_protocol");
-        let msg = format!(
-            "Unsupported protocol {}. Supported protocol IDs: {}",
-            handshake.protocol_version,
-            snapshot.protocol_map.supported_compact_range()
-        );
-        reject_with_reason(&mut client, handshake.next_state, &msg).await?;
-        return Ok(());
-    }
-
-    if state.shutdown.is_draining() {
-        state.metrics.inc_reject("draining");
-        reject_with_reason(
-            &mut client,
-            handshake.next_state,
-            &snapshot.config.shutdown.disconnect_message,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    match handshake.next_state {
-        1 => {
-            handle_status(&mut client, &snapshot, &state, &handshake).await?;
-        }
-        2 => {
-            let client_ip = peer.ip().to_string();
-            if let Err(e) = handle_login(
-                &mut client,
-                &snapshot,
-                &state,
-                handshake.protocol_version,
-                login_timeout,
-                &client_ip,
-                peer,
-            )
-            .await
-            {
-                error!("login error peer={} err={:#}", peer, e);
-                return Err(e);
+    let mut connection_result = ConnectionResult::Success;
+    let result: Result<()> = async {
+        let mut conn_mem = match state
+            .memory_budget()
+            .acquire_connection(snapshot.config.limits.initial_buffer_bytes)
+        {
+            Ok(mem) => mem,
+            Err(_) => {
+                connection_result = ConnectionResult::Reject;
+                state.metrics.inc_reject("memory_budget");
+                reject_without_handshake(&mut client, "Proxy memory budget exceeded").await?;
+                return Ok(());
             }
+        };
+        conn_mem.reserve_for(snapshot.config.limits.initial_buffer_bytes)?;
+
+        let handshake_timeout = Duration::from_millis(snapshot.config.limits.handshake_timeout_ms);
+        let login_timeout = Duration::from_millis(snapshot.config.limits.login_timeout_ms);
+
+        let handshake_packet = match timeout(
+            handshake_timeout,
+            read_first_packet(&mut client, snapshot.config.limits.max_packet_size),
+        )
+        .await
+        {
+            Ok(Ok(packet)) => packet,
+            Ok(Err(FirstFrameError::Malformed)) => {
+                connection_result = ConnectionResult::Reject;
+                state.metrics.inc_reject("malformed_frame");
+                return Ok(());
+            }
+            Ok(Err(FirstFrameError::Io(err))) => {
+                return Err(err.into());
+            }
+            Err(_) => return Err(anyhow::anyhow!("handshake timeout")),
+        };
+
+        let handshake = parse_handshake(&handshake_packet)?;
+        let version_label = snapshot
+            .protocol_map
+            .version_label_for_id(handshake.protocol_version)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| handshake.protocol_version.to_string());
+        state.metrics.inc_protocol_version(&version_label);
+        debug!(
+            peer = %peer,
+            host = %handshake.server_address,
+            port = handshake.server_port,
+            protocol = handshake.protocol_version,
+            next_state = handshake.next_state,
+            "received handshake"
+        );
+
+        if !snapshot
+            .protocol_map
+            .is_supported(handshake.protocol_version)
+        {
+            connection_result = ConnectionResult::Reject;
+            state.metrics.inc_reject("unsupported_protocol");
+            let msg = format!(
+                "Unsupported protocol {}. Supported protocol IDs: {}",
+                handshake.protocol_version,
+                snapshot.protocol_map.supported_compact_range()
+            );
+            reject_with_reason(&mut client, handshake.next_state, &msg).await?;
             return Ok(());
         }
-        _ => {
-            state.metrics.inc_reject("bad_next_state");
-            reject_with_reason(&mut client, 2, "Invalid next state in handshake").await?;
+
+        if state.shutdown.is_draining() {
+            connection_result = ConnectionResult::Reject;
+            state.metrics.inc_reject("draining");
+            reject_with_reason(
+                &mut client,
+                handshake.next_state,
+                &snapshot.config.shutdown.disconnect_message,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        match handshake.next_state {
+            1 => {
+                handle_status(&mut client, &snapshot, &state, &handshake).await?;
+            }
+            2 => {
+                let client_ip = peer.ip().to_string();
+                match handle_login(
+                    &mut client,
+                    &snapshot,
+                    &state,
+                    handshake.protocol_version,
+                    login_timeout,
+                    &client_ip,
+                    peer,
+                )
+                .await
+                {
+                    Ok(LoginOutcome::Accepted) => {
+                        connection_result = ConnectionResult::Success;
+                    }
+                    Ok(LoginOutcome::Rejected) => {
+                        connection_result = ConnectionResult::Reject;
+                    }
+                    Err(e) => {
+                        error!("login error peer={} err={:#}", peer, e);
+                        return Err(e);
+                    }
+                }
+                return Ok(());
+            }
+            _ => {
+                connection_result = ConnectionResult::Reject;
+                state.metrics.inc_reject("bad_next_state");
+                reject_with_reason(&mut client, 2, "Invalid next state in handshake").await?;
+            }
+        }
+
+        debug!(peer = %peer, "connection finished");
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            state
+                .metrics
+                .inc_connection_result(connection_result.as_label());
+        }
+        Err(_) => {
+            state.metrics.inc_connection_result("error");
         }
     }
-
-    debug!(peer = %peer, "connection finished");
-    Ok(())
+    state
+        .metrics
+        .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
+    result
 }
 
 enum FirstFrameError {
@@ -333,215 +408,305 @@ async fn handle_login(
     login_timeout: Duration,
     client_ip: &str,
     peer: SocketAddr,
-) -> Result<()> {
-    let login_start_packet = timeout(
-        login_timeout,
-        read_client_packet(client, snapshot.config.limits.max_packet_size, None),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("login start timeout"))??;
-
-    let login_start_username =
-        parse_login_start_username(&login_start_packet)?.unwrap_or_else(|| "unknown".to_string());
-    debug!(username = %login_start_username, "incoming login start");
-
+) -> Result<LoginOutcome> {
+    let login_started = Instant::now();
     let auth_mode = state.auth_mode().await;
-    let mut client_crypto: Option<ClientCrypto> = None;
-    let identity = match auth_mode {
-        AuthMode::Offline => {
-            warn!(peer = %peer, "offline auth fallback is active for accepted connection");
-            AuthenticatedIdentity {
-                uuid_bytes: offline_uuid(&login_start_username),
-                username: login_start_username.clone(),
-                properties: Vec::new(),
-            }
-        }
-        AuthMode::Online | AuthMode::Auto => {
-            let server_id = random_ascii(20);
-            let mut verify_token = [0u8; 4];
-            thread_rng().fill(&mut verify_token);
-
-            let crypto = state.crypto();
-            let encryption_request =
-                build_encryption_request(&server_id, crypto.public_key_der(), &verify_token);
-            write_client_packet(client, &encryption_request, None).await?;
-
-            let encryption_response_packet = timeout(
-                login_timeout,
-                read_client_packet(client, snapshot.config.limits.max_packet_size, None),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("encryption response timeout"))??;
-
-            let EncryptionResponse {
-                shared_secret,
-                verify_token: encrypted_verify_token,
-            } = parse_encryption_response(&encryption_response_packet)?
-                .ok_or_else(|| anyhow::anyhow!("expected encryption response packet id 0x01"))?;
-
-            let decrypted_secret = crypto.decrypt(&shared_secret)?;
-            if decrypted_secret.len() != 16 {
-                send_login_disconnect_best_effort(client, "Invalid shared secret", None).await?;
-                return Ok(());
-            }
-            let decrypted_verify_token = crypto.decrypt(&encrypted_verify_token)?;
-            if decrypted_verify_token.as_slice() != verify_token {
-                send_login_disconnect_best_effort(client, "Invalid verify token", None).await?;
-                return Ok(());
-            }
-
-            let shared_secret: [u8; 16] = decrypted_secret
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("shared secret must be 16 bytes"))?;
-            client_crypto = Some(ClientCrypto::new(&shared_secret)?);
-
-            let server_hash =
-                compute_minecraft_server_hash(&server_id, &shared_secret, crypto.public_key_der());
-            let profile = match authenticate_online(
-                state,
-                &login_start_username,
-                &server_hash,
-                login_timeout,
-            )
-            .await
-            {
-                Ok(profile) => profile,
-                Err(MojangAuthError::AuthenticationFailed) => {
-                    send_login_disconnect_best_effort(
-                        client,
-                        "Authentication failed",
-                        client_crypto.as_mut(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                Err(MojangAuthError::ServiceUnavailable) => {
-                    send_login_disconnect_best_effort(
-                        client,
-                        "Authentication service unavailable. Try again later.",
-                        client_crypto.as_mut(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-
-            let uuid_bytes = parse_mojang_uuid_bytes(&profile.id)?;
-            let properties = profile
-                .properties
-                .into_iter()
-                .map(|property| VelocityProperty {
-                    name: property.name,
-                    value: property.value,
-                    signature: property.signature,
-                })
-                .collect::<Vec<_>>();
-            AuthenticatedIdentity {
-                uuid_bytes,
-                username: profile.name,
-                properties,
-            }
-        }
+    let auth_mode_label = match auth_mode {
+        AuthMode::Offline => "offline",
+        AuthMode::Online | AuthMode::Auto => "online",
     };
 
-    let Some(lease) = snapshot.backends.choose_backend() else {
-        state.metrics.inc_reject("no_healthy_backend");
-        send_login_disconnect_best_effort(
-            client,
-            "No healthy backend available. Try again in a few seconds.",
-            client_crypto.as_mut(),
+    let result: Result<LoginOutcome> = async {
+        let login_start_packet = match timeout(
+            login_timeout,
+            read_client_packet(client, snapshot.config.limits.max_packet_size, None),
         )
-        .await?;
-        return Ok(());
-    };
-
-    let backend = lease.backend().clone();
-    let mut backend_stream =
-        match timeout(login_timeout, TcpStream::connect(backend.address())).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                state
-                    .metrics
-                    .inc_backend_error(backend.name(), "connect_error");
-                send_login_disconnect_best_effort(
-                    client,
-                    "Failed to connect backend",
-                    client_crypto.as_mut(),
-                )
-                .await?;
-                return Err(anyhow::anyhow!("backend connect error: {err}"));
-            }
+        .await
+        {
+            Ok(Ok(packet)) => packet,
+            Ok(Err(err)) => return Err(err),
             Err(_) => {
-                state
-                    .metrics
-                    .inc_backend_error(backend.name(), "connect_timeout");
-                send_login_disconnect_best_effort(
-                    client,
-                    "Backend connection timeout",
-                    client_crypto.as_mut(),
-                )
-                .await?;
-                return Err(anyhow::anyhow!("backend connect timeout"));
+                state.metrics.inc_login_failure("timeout");
+                return Err(anyhow::anyhow!("login start timeout"));
             }
         };
 
-    let (host, port) = split_host_port(backend.address())?;
-    let rewritten_handshake = crate::mc::build_handshake_packet(protocol_version, host, port, 2);
-    write_packet(&mut backend_stream, &rewritten_handshake).await?;
-    write_packet(&mut backend_stream, &login_start_packet).await?;
-    tracing::debug!("forwarded login start to backend peer={}", peer);
+        let login_start_username = parse_login_start_username(&login_start_packet)?
+            .unwrap_or_else(|| "unknown".to_string());
+        debug!(username = %login_start_username, "incoming login start");
 
-    if snapshot.config.forwarding.velocity.enabled {
-        tracing::debug!("entering velocity intercept loop peer={}", peer);
-        let login_phase = run_velocity_login_intercept(
-            client,
-            client_crypto.as_mut(),
-            &mut backend_stream,
-            snapshot.config.limits.max_packet_size,
-            client_ip,
-            &identity,
-            &snapshot.config.forwarding.velocity.secret,
-            peer,
-        )
-        .await?;
-        if matches!(login_phase, LoginPhaseOutcome::Terminated) {
-            return Ok(());
-        }
-    }
-
-    let mut shutdown_rx = state.shutdown.subscribe();
-    let shutdown_message = snapshot.config.shutdown.disconnect_message.clone();
-
-    let mut shutdown_requested = false;
-    if let Some(crypto) = client_crypto {
-        relay_with_encrypted_client(client, &mut backend_stream, crypto, &mut shutdown_rx).await?;
-    } else {
-        let relay = copy_bidirectional(client, &mut backend_stream);
-        tokio::pin!(relay);
-        tokio::select! {
-            result = &mut relay => {
-                let _ = result?;
-            }
-            changed = shutdown_rx.changed() => {
-                if changed.is_ok() && shutdown_rx.borrow().is_some() {
-                    shutdown_requested = true;
+        let mut client_crypto: Option<ClientCrypto> = None;
+        let identity = match auth_mode {
+            AuthMode::Offline => {
+                warn!(peer = %peer, "offline auth fallback is active for accepted connection");
+                AuthenticatedIdentity {
+                    uuid_bytes: offline_uuid(&login_start_username),
+                    username: login_start_username.clone(),
+                    properties: Vec::new(),
                 }
             }
+            AuthMode::Online | AuthMode::Auto => {
+                let server_id = random_ascii(20);
+                let mut verify_token = [0u8; 4];
+                thread_rng().fill(&mut verify_token);
+
+                let crypto = state.crypto();
+                let encryption_request =
+                    build_encryption_request(&server_id, crypto.public_key_der(), &verify_token);
+                write_client_packet(client, &encryption_request, None).await?;
+
+                let encryption_response_packet = match timeout(
+                    login_timeout,
+                    read_client_packet(client, snapshot.config.limits.max_packet_size, None),
+                )
+                .await
+                {
+                    Ok(Ok(packet)) => packet,
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        state.metrics.inc_login_failure("timeout");
+                        return Err(anyhow::anyhow!("encryption response timeout"));
+                    }
+                };
+
+                let EncryptionResponse {
+                    shared_secret,
+                    verify_token: encrypted_verify_token,
+                } = parse_encryption_response(&encryption_response_packet)?.ok_or_else(|| {
+                    anyhow::anyhow!("expected encryption response packet id 0x01")
+                })?;
+
+                let decrypted_secret = crypto.decrypt(&shared_secret)?;
+                if decrypted_secret.len() != 16 {
+                    state.metrics.inc_login_failure("auth_failed");
+                    send_login_disconnect_best_effort(client, "Invalid shared secret", None)
+                        .await?;
+                    return Ok(LoginOutcome::Rejected);
+                }
+                let decrypted_verify_token = crypto.decrypt(&encrypted_verify_token)?;
+                if decrypted_verify_token.as_slice() != verify_token {
+                    state.metrics.inc_login_failure("auth_failed");
+                    send_login_disconnect_best_effort(client, "Invalid verify token", None).await?;
+                    return Ok(LoginOutcome::Rejected);
+                }
+
+                let shared_secret: [u8; 16] = decrypted_secret
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("shared secret must be 16 bytes"))?;
+                client_crypto = Some(ClientCrypto::new(&shared_secret)?);
+
+                let server_hash = compute_minecraft_server_hash(
+                    &server_id,
+                    &shared_secret,
+                    crypto.public_key_der(),
+                );
+                let profile = match authenticate_online(
+                    state,
+                    &login_start_username,
+                    &server_hash,
+                    login_timeout,
+                )
+                .await
+                {
+                    Ok(profile) => profile,
+                    Err(MojangAuthError::AuthenticationFailed) => {
+                        state.metrics.inc_login_failure("auth_failed");
+                        send_login_disconnect_best_effort(
+                            client,
+                            "Authentication failed",
+                            client_crypto.as_mut(),
+                        )
+                        .await?;
+                        return Ok(LoginOutcome::Rejected);
+                    }
+                    Err(MojangAuthError::CircuitOpen) => {
+                        state.metrics.inc_login_failure("circuit_open");
+                        send_login_disconnect_best_effort(
+                            client,
+                            "Authentication service unavailable. Try again later.",
+                            client_crypto.as_mut(),
+                        )
+                        .await?;
+                        return Ok(LoginOutcome::Rejected);
+                    }
+                    Err(MojangAuthError::ServiceUnavailable) => {
+                        state.metrics.inc_login_failure("timeout");
+                        send_login_disconnect_best_effort(
+                            client,
+                            "Authentication service unavailable. Try again later.",
+                            client_crypto.as_mut(),
+                        )
+                        .await?;
+                        return Ok(LoginOutcome::Rejected);
+                    }
+                };
+
+                let uuid_bytes = parse_mojang_uuid_bytes(&profile.id)?;
+                let properties = profile
+                    .properties
+                    .into_iter()
+                    .map(|property| VelocityProperty {
+                        name: property.name,
+                        value: property.value,
+                        signature: property.signature,
+                    })
+                    .collect::<Vec<_>>();
+                AuthenticatedIdentity {
+                    uuid_bytes,
+                    username: profile.name,
+                    properties,
+                }
+            }
+        };
+
+        let Some(lease) = snapshot.backends.choose_backend() else {
+            state.metrics.inc_reject("no_healthy_backend");
+            state.metrics.inc_login_failure("backend_unavailable");
+            send_login_disconnect_best_effort(
+                client,
+                "No healthy backend available. Try again in a few seconds.",
+                client_crypto.as_mut(),
+            )
+            .await?;
+            return Ok(LoginOutcome::Rejected);
+        };
+
+        let backend = lease.backend().clone();
+        let mut backend_stream =
+            match timeout(login_timeout, TcpStream::connect(backend.address())).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    state
+                        .metrics
+                        .inc_backend_error(backend.name(), "connect_error");
+                    state.metrics.inc_login_failure("backend_unavailable");
+                    send_login_disconnect_best_effort(
+                        client,
+                        "Failed to connect backend",
+                        client_crypto.as_mut(),
+                    )
+                    .await?;
+                    return Err(anyhow::anyhow!("backend connect error: {err}"));
+                }
+                Err(_) => {
+                    state
+                        .metrics
+                        .inc_backend_error(backend.name(), "connect_timeout");
+                    state.metrics.inc_login_failure("backend_unavailable");
+                    send_login_disconnect_best_effort(
+                        client,
+                        "Backend connection timeout",
+                        client_crypto.as_mut(),
+                    )
+                    .await?;
+                    return Err(anyhow::anyhow!("backend connect timeout"));
+                }
+            };
+
+        let (host, port) = split_host_port(backend.address())?;
+        let rewritten_handshake =
+            crate::mc::build_handshake_packet(protocol_version, host, port, 2);
+        write_packet(&mut backend_stream, &rewritten_handshake).await?;
+        write_packet(&mut backend_stream, &login_start_packet).await?;
+        tracing::debug!("forwarded login start to backend peer={}", peer);
+
+        if snapshot.config.forwarding.velocity.enabled {
+            tracing::debug!("entering velocity intercept loop peer={}", peer);
+            let login_phase = run_velocity_login_intercept(
+                client,
+                client_crypto.as_mut(),
+                &mut backend_stream,
+                snapshot.config.limits.max_packet_size,
+                client_ip,
+                &identity,
+                &snapshot.config.forwarding.velocity.secret,
+                peer,
+            )
+            .await?;
+            if matches!(login_phase, LoginPhaseOutcome::Terminated) {
+                return Ok(LoginOutcome::Rejected);
+            }
+        }
+
+        let mut shutdown_rx = state.shutdown.subscribe();
+        let shutdown_message = snapshot.config.shutdown.disconnect_message.clone();
+
+        let mut shutdown_requested = false;
+        let relay_traffic = if let Some(crypto) = client_crypto {
+            relay_with_encrypted_client(client, &mut backend_stream, crypto, &mut shutdown_rx)
+                .await?
+        } else {
+            let relay = copy_bidirectional(client, &mut backend_stream);
+            tokio::pin!(relay);
+            let mut totals = RelayTraffic::default();
+            tokio::select! {
+                result = &mut relay => {
+                    let (to_backend, from_backend) = result?;
+                    totals.to_backend = to_backend;
+                    totals.from_backend = from_backend;
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && shutdown_rx.borrow().is_some() {
+                        shutdown_requested = true;
+                    }
+                }
+            }
+            totals
+        };
+
+        state
+            .metrics
+            .inc_backend_bytes_sent(backend.name(), relay_traffic.to_backend);
+        state
+            .metrics
+            .inc_backend_bytes_recv(backend.name(), relay_traffic.from_backend);
+
+        if shutdown_requested {
+            let _ = send_login_disconnect_best_effort(client, &shutdown_message, None).await;
+        }
+
+        Ok(LoginOutcome::Accepted)
+    }
+    .await;
+
+    state
+        .metrics
+        .observe_login_duration(auth_mode_label, login_started.elapsed().as_secs_f64());
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionResult {
+    Success,
+    Reject,
+}
+
+impl ConnectionResult {
+    fn as_label(self) -> &'static str {
+        match self {
+            ConnectionResult::Success => "success",
+            ConnectionResult::Reject => "reject",
         }
     }
+}
 
-    if shutdown_requested {
-        let _ = send_login_disconnect_best_effort(client, &shutdown_message, None).await;
-    }
-
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginOutcome {
+    Accepted,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoginPhaseOutcome {
     ContinueToRelay,
     Terminated,
+}
+
+#[derive(Default)]
+struct RelayTraffic {
+    to_backend: u64,
+    from_backend: u64,
 }
 
 struct ClientCrypto {
@@ -641,6 +806,7 @@ struct MojangProperty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MojangAuthError {
     AuthenticationFailed,
+    CircuitOpen,
     ServiceUnavailable,
 }
 
@@ -749,7 +915,7 @@ async fn authenticate_online(
 ) -> Result<MojangHasJoinedProfile, MojangAuthError> {
     let circuit = state.auth_circuit();
     if !circuit.allow_request() {
-        return Err(MojangAuthError::ServiceUnavailable);
+        return Err(MojangAuthError::CircuitOpen);
     }
 
     let client = state.mojang_client();
@@ -770,6 +936,7 @@ async fn authenticate_online(
             }
             Err(MojangAuthError::ServiceUnavailable)
         }
+        Err(MojangAuthError::CircuitOpen) => Err(MojangAuthError::CircuitOpen),
     }
 }
 
@@ -813,7 +980,7 @@ async fn request_mojang_profile(
             Ok(_) => {
                 return Err(MojangAuthError::AuthenticationFailed);
             }
-            Err(_) => {
+            Err(_err) => {
                 if attempt < 2 {
                     jitter_sleep().await;
                     continue;
@@ -955,11 +1122,12 @@ async fn relay_with_encrypted_client(
     backend: &mut TcpStream,
     mut client_crypto: ClientCrypto,
     shutdown_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
-) -> Result<()> {
+) -> Result<RelayTraffic> {
     let (mut client_reader, mut client_writer) = client.split();
     let (mut backend_reader, mut backend_writer) = backend.split();
     let mut client_to_backend = vec![0u8; 16 * 1024];
     let mut backend_to_client = vec![0u8; 16 * 1024];
+    let mut totals = RelayTraffic::default();
 
     loop {
         tokio::select! {
@@ -970,6 +1138,7 @@ async fn relay_with_encrypted_client(
                 }
                 (&mut client_crypto.decryptor).decrypt(&mut client_to_backend[..n]);
                 backend_writer.write_all(&client_to_backend[..n]).await?;
+                totals.to_backend = totals.to_backend.saturating_add(n as u64);
             }
             read = backend_reader.read(&mut backend_to_client) => {
                 let n = read?;
@@ -978,6 +1147,7 @@ async fn relay_with_encrypted_client(
                 }
                 (&mut client_crypto.encryptor).encrypt(&mut backend_to_client[..n]);
                 client_writer.write_all(&backend_to_client[..n]).await?;
+                totals.from_backend = totals.from_backend.saturating_add(n as u64);
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && shutdown_rx.borrow().is_some() {
@@ -986,7 +1156,7 @@ async fn relay_with_encrypted_client(
             }
         }
     }
-    Ok(())
+    Ok(totals)
 }
 
 async fn reject_with_reason(stream: &mut TcpStream, next_state: i32, message: &str) -> Result<()> {
