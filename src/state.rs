@@ -4,6 +4,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::sync::{RwLock, Semaphore};
 
+use crate::analytics::AttackAnalytics;
 use crate::auth_circuit::AuthCircuitBreaker;
 use crate::backend::BackendPool;
 use crate::config::{AuthMode, Config};
@@ -12,6 +13,7 @@ use crate::limiter::ConnectionLimiter;
 use crate::memory::MemoryBudget;
 use crate::metrics::Metrics;
 use crate::protocol_map::ProtocolMap;
+use crate::reputation::ReputationStore;
 use crate::shutdown::ShutdownManager;
 
 pub struct RuntimeSnapshot {
@@ -43,6 +45,8 @@ pub struct RuntimeState {
     mojang_client: Arc<reqwest::Client>,
     mojang_session_base_url: Arc<String>,
     limiter: Arc<ConnectionLimiter>,
+    reputation: Arc<ReputationStore>,
+    attack_analytics: Arc<AttackAnalytics>,
 }
 
 impl RuntimeState {
@@ -63,6 +67,8 @@ impl RuntimeState {
             .build()?;
         let mojang_session_base_url = std::env::var("VEX_MOJANG_SESSION_BASE_URL")
             .unwrap_or_else(|_| "https://sessionserver.mojang.com".to_string());
+        let reputation = Arc::new(ReputationStore::new(config.reputation.clone()));
+        let attack_analytics = Arc::new(AttackAnalytics::new(config.anti_bot.clone()));
         Ok(Self {
             snapshot: Arc::new(ArcSwap::from_pointee(RuntimeSnapshot::new(
                 config.clone(),
@@ -83,6 +89,8 @@ impl RuntimeState {
                 config.limits.per_ip_rate_limit,
                 config.limits.per_subnet_rate_limit,
             )),
+            reputation,
+            attack_analytics,
         })
     }
 
@@ -124,6 +132,14 @@ impl RuntimeState {
 
     pub fn limiter(&self) -> Arc<ConnectionLimiter> {
         self.limiter.clone()
+    }
+
+    pub fn reputation(&self) -> Arc<ReputationStore> {
+        self.reputation.clone()
+    }
+
+    pub fn attack_analytics(&self) -> Arc<AttackAnalytics> {
+        self.attack_analytics.clone()
     }
 
     pub async fn apply_reload(

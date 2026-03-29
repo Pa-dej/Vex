@@ -16,6 +16,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use crate::analytics::AttackUpdate;
 use crate::auth_circuit::CircuitState;
 use crate::config::AuthMode;
 use crate::limiter::AcquireRejectReason;
@@ -28,6 +29,7 @@ use crate::mc::{
     parse_login_start_username, parse_packet_id, parse_set_compression_threshold, parse_varint,
     read_packet, write_packet, write_varint,
 };
+use crate::reputation::{ReputationAction, connection_block_message};
 use crate::state::RuntimeState;
 use crate::telemetry::generate_trace_id;
 
@@ -57,10 +59,13 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                     }
                 };
                 let accepted_at = Instant::now();
+                let connection_update = state.attack_analytics().record_connection(addr.ip());
+                apply_attack_update(&state, connection_update);
 
                 let limiter_lease = match state.limiter().try_acquire(addr.ip()) {
                     Ok(lease) => lease,
                     Err(AcquireRejectReason::GlobalCap) => {
+                        state.reputation().record_rate_limit_hit(addr.ip());
                         state.metrics.inc_reject("global_cap");
                         state.metrics.inc_ratelimit_hit("global");
                         state.metrics.inc_connection_result("reject");
@@ -72,6 +77,7 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                         continue;
                     }
                     Err(AcquireRejectReason::IpRateLimit) => {
+                        state.reputation().record_rate_limit_hit(addr.ip());
                         state.metrics.inc_reject("ip_rate_limit");
                         state.metrics.inc_ratelimit_hit("ip");
                         state.metrics.inc_connection_result("reject");
@@ -87,6 +93,7 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                         continue;
                     }
                     Err(AcquireRejectReason::SubnetRateLimit) => {
+                        state.reputation().record_rate_limit_hit(addr.ip());
                         state.metrics.inc_reject("subnet_rate_limit");
                         state.metrics.inc_ratelimit_hit("subnet");
                         state.metrics.inc_connection_result("reject");
@@ -99,6 +106,38 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                             "Too many connections from your address",
                         )
                         .await;
+                        continue;
+                    }
+                };
+
+                let reputation_delay = match state.reputation().assess_connection(addr.ip()) {
+                    ReputationAction::Allow => None,
+                    ReputationAction::Delay {
+                        duration,
+                        tier_label,
+                        warn,
+                    } => {
+                        state.metrics.inc_reputation_delay(tier_label);
+                        if warn {
+                            warn!(peer = %addr, delay_ms = duration.as_millis(), "low reputation connection delayed");
+                        }
+                        Some(duration)
+                    }
+                    ReputationAction::Block {
+                        duration_label,
+                        newly_applied,
+                        ..
+                    } => {
+                        if newly_applied {
+                            state.metrics.inc_reputation_block(duration_label);
+                        }
+                        state.metrics.inc_reject("reputation_block");
+                        state.metrics.inc_connection_result("reject");
+                        state
+                            .metrics
+                            .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
+                        let mut stream = stream;
+                        let _ = reject_without_handshake(&mut stream, connection_block_message()).await;
                         continue;
                     }
                 };
@@ -133,6 +172,7 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                             stream,
                             addr,
                             accepted_at,
+                            reputation_delay,
                             state_clone,
                             permit,
                             limiter_lease,
@@ -152,10 +192,38 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
     Ok(())
 }
 
+fn apply_attack_update(state: &RuntimeState, update: AttackUpdate) {
+    state
+        .metrics
+        .set_connections_per_second(update.connections_per_second);
+    state
+        .metrics
+        .set_unique_ips_per_minute(update.unique_ips_per_minute);
+    state
+        .metrics
+        .set_attack_mode_active(update.attack_mode_active);
+
+    if let Some(enabled) = update.mode_changed {
+        state.limiter().set_attack_mode(enabled);
+        if enabled {
+            state.metrics.inc_attack_detection();
+            warn!(
+                cps = update.connections_per_second,
+                unique_ips_per_minute = update.unique_ips_per_minute,
+                login_fail_ratio = update.login_fail_ratio,
+                "attack pattern detected"
+            );
+        } else {
+            info!("attack mode exited");
+        }
+    }
+}
+
 async fn handle_connection(
     mut client: TcpStream,
     peer: SocketAddr,
     accepted_at: Instant,
+    reputation_delay: Option<Duration>,
     state: RuntimeState,
     _permit: OwnedSemaphorePermit,
     _limiter_lease: crate::limiter::ConnectionLease,
@@ -194,13 +262,17 @@ async fn handle_connection(
             Ok(Ok(packet)) => packet,
             Ok(Err(FirstFrameError::Malformed)) => {
                 connection_result = ConnectionResult::Reject;
+                state.reputation().record_malformed_frame(peer.ip());
                 state.metrics.inc_reject("malformed_frame");
                 return Ok(());
             }
             Ok(Err(FirstFrameError::Io(err))) => {
                 return Err(err.into());
             }
-            Err(_) => return Err(anyhow::anyhow!("handshake timeout")),
+            Err(_) => {
+                state.reputation().record_handshake_timeout(peer.ip());
+                return Err(anyhow::anyhow!("handshake timeout"));
+            }
         };
 
         let handshake = parse_handshake(&handshake_packet)?;
@@ -258,6 +330,7 @@ async fn handle_connection(
                     &state,
                     handshake.protocol_version,
                     login_timeout,
+                    reputation_delay,
                     &client_ip,
                     peer,
                 )
@@ -265,11 +338,18 @@ async fn handle_connection(
                 {
                     Ok(LoginOutcome::Accepted) => {
                         connection_result = ConnectionResult::Success;
+                        state.reputation().record_successful_login(peer.ip());
+                        let update = state.attack_analytics().record_login_result(true);
+                        apply_attack_update(&state, update);
                     }
                     Ok(LoginOutcome::Rejected) => {
                         connection_result = ConnectionResult::Reject;
+                        let update = state.attack_analytics().record_login_result(false);
+                        apply_attack_update(&state, update);
                     }
                     Err(e) => {
+                        let update = state.attack_analytics().record_login_result(false);
+                        apply_attack_update(&state, update);
                         error!("login error peer={} err={:#}", peer, e);
                         return Err(e);
                     }
@@ -406,6 +486,7 @@ async fn handle_login(
     state: &RuntimeState,
     protocol_version: i32,
     login_timeout: Duration,
+    reputation_delay: Option<Duration>,
     client_ip: &str,
     peer: SocketAddr,
 ) -> Result<LoginOutcome> {
@@ -560,6 +641,10 @@ async fn handle_login(
             }
         };
 
+        if let Some(delay) = reputation_delay {
+            tokio::time::sleep(delay).await;
+        }
+
         let Some(lease) = snapshot.backends.choose_backend() else {
             state.metrics.inc_reject("no_healthy_backend");
             state.metrics.inc_login_failure("backend_unavailable");
@@ -625,6 +710,7 @@ async fn handle_login(
             )
             .await?;
             if matches!(login_phase, LoginPhaseOutcome::Terminated) {
+                state.reputation().record_login_disconnect(peer.ip());
                 return Ok(LoginOutcome::Rejected);
             }
         }
@@ -1215,8 +1301,9 @@ impl Drop for ActiveConnectionGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bytes::BytesMut;
     use tokio::net::{TcpListener, TcpStream};
@@ -1231,7 +1318,7 @@ mod tests {
     use crate::mc::{
         build_handshake_packet, build_login_disconnect, build_login_plugin_request,
         build_login_start_packet, decode_login_packet_from_backend,
-        encode_login_packet_for_backend, offline_uuid, parse_login_plugin_response,
+        encode_login_packet_for_backend, offline_uuid, parse_login_plugin_response, parse_varint,
         parse_velocity_modern_forwarding_payload, sign_hmac_sha256, write_varint,
     };
     use crate::metrics::Metrics;
@@ -1470,5 +1557,186 @@ mod tests {
         let server_result = timeout(Duration::from_secs(5), server_task).await??;
         server_result?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn low_reputation_ip_is_blocked_with_suspicious_activity_message() -> Result<()> {
+        let backend_probe = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_addr = backend_probe.local_addr()?;
+        drop(backend_probe);
+
+        let proxy_probe = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_addr = proxy_probe.local_addr()?;
+        drop(proxy_probe);
+
+        let mut config = Config::default();
+        config.listener.bind = proxy_addr.to_string();
+        config.shutdown.drain_seconds = 0;
+        config.routing.backends = vec![BackendConfig {
+            name: "backend".to_string(),
+            address: backend_addr.to_string(),
+            weight: 1.0,
+        }];
+
+        let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
+        let metrics = Arc::new(Metrics::new()?);
+        let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        state
+            .reputation()
+            .set_score_for_test(IpAddr::V4(Ipv4Addr::LOCALHOST), 5);
+
+        let server_state = state.clone();
+        let server_task = tokio::spawn(async move { run_proxy_server(server_state).await });
+
+        let mut client = TcpStream::connect(proxy_addr).await?;
+        let packet = timeout(
+            Duration::from_secs(3),
+            read_packet(&mut client, 8 * 1024 * 1024),
+        )
+        .await??;
+        let text = parse_disconnect_text(&packet)?;
+        assert!(
+            text.contains("suspicious activity"),
+            "unexpected disconnect message: {text}"
+        );
+
+        state.shutdown.trigger("test complete".to_string());
+        let _ = timeout(Duration::from_secs(5), server_task).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn medium_reputation_adds_connection_delay() -> Result<()> {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_addr = backend_listener.local_addr()?;
+
+        let proxy_probe = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_addr = proxy_probe.local_addr()?;
+        drop(proxy_probe);
+
+        let mut config = Config::default();
+        config.listener.bind = proxy_addr.to_string();
+        config.shutdown.drain_seconds = 0;
+        config.routing.backends = vec![BackendConfig {
+            name: "backend".to_string(),
+            address: backend_addr.to_string(),
+            weight: 1.0,
+        }];
+        config.forwarding.velocity.enabled = false;
+
+        let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
+        let metrics = Arc::new(Metrics::new()?);
+        let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        state
+            .reputation()
+            .set_score_for_test(IpAddr::V4(Ipv4Addr::LOCALHOST), 30);
+
+        let server_state = state.clone();
+        let server_task = tokio::spawn(async move { run_proxy_server(server_state).await });
+
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await?;
+            let accepted = Instant::now();
+            let _ = read_packet(&mut stream, 8 * 1024 * 1024).await?;
+            let _ = read_packet(&mut stream, 8 * 1024 * 1024).await?;
+            Result::<Instant>::Ok(accepted)
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await?;
+        let start = Instant::now();
+        let handshake = build_handshake_packet(767, "localhost", proxy_addr.port(), 2);
+        write_packet(&mut client, &handshake).await?;
+        let login_start = build_login_start_packet("DelayUser");
+        write_packet(&mut client, &login_start).await?;
+
+        let accepted_at = timeout(Duration::from_secs(5), backend_task).await???;
+        let elapsed = accepted_at.saturating_duration_since(start);
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "expected >=180ms delay, got {:?}",
+            elapsed
+        );
+
+        state.shutdown.trigger("test complete".to_string());
+        let _ = timeout(Duration::from_secs(5), server_task).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn high_reputation_connection_has_no_artificial_delay() -> Result<()> {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_addr = backend_listener.local_addr()?;
+
+        let proxy_probe = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_addr = proxy_probe.local_addr()?;
+        drop(proxy_probe);
+
+        let mut config = Config::default();
+        config.listener.bind = proxy_addr.to_string();
+        config.shutdown.drain_seconds = 0;
+        config.routing.backends = vec![BackendConfig {
+            name: "backend".to_string(),
+            address: backend_addr.to_string(),
+            weight: 1.0,
+        }];
+        config.forwarding.velocity.enabled = false;
+
+        let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
+        let metrics = Arc::new(Metrics::new()?);
+        let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        state
+            .reputation()
+            .set_score_for_test(IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
+
+        let server_state = state.clone();
+        let server_task = tokio::spawn(async move { run_proxy_server(server_state).await });
+
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await?;
+            let accepted = Instant::now();
+            let _ = read_packet(&mut stream, 8 * 1024 * 1024).await?;
+            let _ = read_packet(&mut stream, 8 * 1024 * 1024).await?;
+            Result::<Instant>::Ok(accepted)
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await?;
+        let start = Instant::now();
+        let handshake = build_handshake_packet(767, "localhost", proxy_addr.port(), 2);
+        write_packet(&mut client, &handshake).await?;
+        let login_start = build_login_start_packet("FastUser");
+        write_packet(&mut client, &login_start).await?;
+
+        let accepted_at = timeout(Duration::from_secs(5), backend_task).await???;
+        let elapsed = accepted_at.saturating_duration_since(start);
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "expected <180ms without delay, got {:?}",
+            elapsed
+        );
+
+        state.shutdown.trigger("test complete".to_string());
+        let _ = timeout(Duration::from_secs(5), server_task).await??;
+        Ok(())
+    }
+
+    fn parse_disconnect_text(packet: &[u8]) -> Result<String> {
+        let (packet_id, mut offset) = parse_varint(packet)?;
+        if packet_id != 0 {
+            bail!("expected login disconnect packet id 0, got {packet_id}");
+        }
+        let (len, read) = parse_varint(&packet[offset..])?;
+        offset += read;
+        let len = usize::try_from(len)?;
+        let end = offset + len;
+        let raw = std::str::from_utf8(&packet[offset..end])?;
+        let parsed: serde_json::Value = serde_json::from_str(raw)?;
+        Ok(parsed
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(raw)
+            .to_string())
     }
 }

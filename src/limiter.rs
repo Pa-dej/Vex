@@ -73,6 +73,7 @@ pub struct ConnectionLimiter {
     max_connections_total: u32,
     per_ip_rate_limit: u32,
     per_subnet_rate_limit: u32,
+    rate_limit_scale_bps: AtomicU32,
     active_connections: AtomicU32,
     ip_buckets: DashMap<IpAddr, TokenBucket>,
     subnet_buckets: DashMap<[u8; 3], TokenBucket>,
@@ -88,6 +89,7 @@ impl ConnectionLimiter {
             max_connections_total,
             per_ip_rate_limit,
             per_subnet_rate_limit,
+            rate_limit_scale_bps: AtomicU32::new(10_000),
             active_connections: AtomicU32::new(0),
             ip_buckets: DashMap::new(),
             subnet_buckets: DashMap::new(),
@@ -132,6 +134,11 @@ impl ConnectionLimiter {
             .retain(|_, bucket| !bucket.is_stale(now));
     }
 
+    pub fn set_attack_mode(&self, active: bool) {
+        let bps = if active { 5_000 } else { 10_000 };
+        self.rate_limit_scale_bps.store(bps, Ordering::Release);
+    }
+
     pub fn spawn_cleanup_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -142,11 +149,13 @@ impl ConnectionLimiter {
     }
 
     fn take_ip_token(&self, ip: IpAddr, now: Instant) -> bool {
-        self.take_token(&self.ip_buckets, ip, self.per_ip_rate_limit, now)
+        let effective = self.scaled_rate_limit(self.per_ip_rate_limit);
+        self.take_token(&self.ip_buckets, ip, effective, now)
     }
 
     fn take_subnet_token(&self, key: [u8; 3], now: Instant) -> bool {
-        self.take_token(&self.subnet_buckets, key, self.per_subnet_rate_limit, now)
+        let effective = self.scaled_rate_limit(self.per_subnet_rate_limit);
+        self.take_token(&self.subnet_buckets, key, effective, now)
     }
 
     fn take_token<K>(
@@ -165,7 +174,19 @@ impl ConnectionLimiter {
         let mut bucket = map
             .entry(key)
             .or_insert_with(|| TokenBucket::new(rate_limit, rate_limit, now));
+        bucket.capacity = rate_limit as f64;
+        bucket.refill_per_second = rate_limit as f64;
+        bucket.tokens = bucket.tokens.min(bucket.capacity);
         bucket.try_take(now)
+    }
+
+    fn scaled_rate_limit(&self, base: u32) -> u32 {
+        if base == 0 {
+            return 0;
+        }
+        let scale = self.rate_limit_scale_bps.load(Ordering::Acquire) as u64;
+        let scaled = ((base as u64 * scale) / 10_000) as u32;
+        scaled.max(1)
     }
 }
 

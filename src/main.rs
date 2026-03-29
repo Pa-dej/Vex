@@ -1,4 +1,5 @@
 mod admin;
+mod analytics;
 mod auth_circuit;
 mod backend;
 mod config;
@@ -9,6 +10,7 @@ mod mc;
 mod memory;
 mod metrics;
 mod protocol_map;
+mod reputation;
 mod server;
 mod shutdown;
 mod state;
@@ -55,6 +57,7 @@ async fn main() -> Result<()> {
     let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
 
     let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends)?;
+    let _reputation_maintenance_task = state.reputation().spawn_maintenance_task();
 
     spawn_health_checker(state.clone());
 

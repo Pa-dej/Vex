@@ -17,8 +17,22 @@ handshake_timeout_ms = 2000
 login_timeout_ms = 4000
 # Anti-bot rate limits — подними для бенчмарка
 max_connections_total = 100000
-per_ip_rate_limit = 10000
-per_subnet_rate_limit = 20000
+per_ip_rate_limit = 20
+per_subnet_rate_limit = 50
+
+[anti_bot]
+enabled = true
+attack_cps_threshold = 100
+attack_login_fail_ratio = 0.5
+attack_unique_ip_threshold = 500
+
+[reputation]
+enabled = true
+decay_interval_secs = 60
+cleanup_timeout_secs = 600
+block_duration_first_secs = 30
+block_duration_second_secs = 120
+block_duration_max_secs = 600
 
 [health]
 interval_ms = 2000

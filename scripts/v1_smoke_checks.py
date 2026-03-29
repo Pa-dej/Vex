@@ -66,6 +66,22 @@ def recv_packet(sock: socket.socket) -> bytes:
     return recv_exact(sock, packet_len)
 
 
+def read_login_packet(sock: socket.socket) -> Tuple[bytes, int]:
+    """Read packets skipping Set Compression (0x03) until meaningful packet."""
+    compression_enabled = False
+    for _ in range(10):
+        frame = recv_packet(sock)
+        if not frame:
+            raise ConnectionError("socket closed before packet header")
+        packet = decode_login_payload(frame, compression_enabled)
+        packet_id, _ = decode_varint(packet, 0)
+        if packet_id == 0x03:
+            compression_enabled = True
+            continue  # Set Compression - skip
+        return packet, packet_id
+    raise ValueError("too many Set Compression packets")
+
+
 def build_handshake(protocol_id: int, host: str, port: int, next_state: int) -> bytes:
     host_bytes = host.encode("utf-8")
     payload = (
@@ -97,13 +113,20 @@ def parse_login_disconnect(packet: bytes) -> str:
     str_len, str_read = decode_varint(packet, read)
     start = read + str_read
     end = start + str_len
-    body = packet[start:end].decode("utf-8")
-    parsed = json.loads(body)
-    if isinstance(parsed, dict):
-        return str(parsed.get("text", body))
-    if isinstance(parsed, str):
-        return parsed
-    return body
+    if end > len(packet):
+        return f"<truncated packet len={len(packet)}>"
+    body = packet[start:end].decode("utf-8", errors="replace")
+    if not body:
+        return "<empty disconnect message>"
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            return str(parsed.get("text", body))
+        if isinstance(parsed, str):
+            return parsed
+        return body
+    except json.JSONDecodeError:
+        return body
 
 
 def decode_login_payload(packet: bytes, compression_enabled: bool) -> bytes:
@@ -164,16 +187,30 @@ def start_proxy(repo_root: Path) -> Optional[subprocess.Popen]:
         print(f"[info] proxy already running on {host}:{port}")
         return None
 
-    print("[info] starting proxy via cargo run --quiet")
+    log_path = repo_root / ".vex_smoke_proxy.log"
+    print("[info] starting proxy via cargo run --quiet --bin Vex")
+    log_file = log_path.open("wb")
     proc = subprocess.Popen(
-        ["cargo", "run", "--quiet"],
+        ["cargo", "run", "--quiet", "--bin", "Vex"],
         cwd=repo_root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
     )
+    log_file.close()
     deadline = time.time() + 25
     while time.time() < deadline:
         if proc.poll() is not None:
+            details = ""
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+                if tail:
+                    details = "\n".join(tail)
+            except OSError:
+                details = ""
+            if details:
+                raise RuntimeError(
+                    f"proxy exited during startup. Last log lines:\n{details}"
+                )
             raise RuntimeError("proxy exited during startup")
         if try_connect(host, port):
             print(f"[info] proxy started on {host}:{port}")
@@ -247,18 +284,18 @@ def test_hot_reload(
             sock.sendall(build_handshake(762, "localhost", port, 2))
             sock.sendall(build_login_start("reloadplayer"))
             try:
-                packet = recv_packet(sock)
-                packet_id, _ = decode_varint(packet, 0)
-                if packet_id in (0x01, 0x02):
-                    return (
-                        True,
-                        f"protocol 762 accepted after reload (packet={packet_id:#04x})",
-                    )
-                if packet_id == 0x00:
-                    msg = parse_login_disconnect(packet)
+                packet, packet_id = read_login_packet(sock)
+                if packet_id == 0x01:
+                    return True, "protocol 762 accepted after reload (encryption request)"
+                elif packet_id == 0x02:
+                    return True, "protocol 762 accepted after reload (login success)"
+                elif packet_id == 0x00:
+                    try:
+                        msg = parse_login_disconnect(packet)
+                    except Exception as e:
+                        msg = f"<parse error: {e}>"
                     passed = "Unsupported protocol" not in msg
-                    detail = "passed (backend unavailable)" if passed else f"still rejected: {msg}"
-                    return passed, detail
+                    return passed, msg
                 return False, f"unexpected packet id={packet_id:#04x}"
             except socket.timeout:
                 return True, "protocol 762 accepted after reload (waiting for encryption)"
@@ -297,10 +334,7 @@ def test_velocity_login(host: str, port: int) -> Tuple[bool, str]:
         sock.sendall(build_handshake(774, host, port, 2))
         sock.sendall(build_login_start("smoke_test_player"))
         try:
-            packet = recv_packet(sock)
-            if not packet:
-                return False, "empty packet"
-            packet_id = packet[0]
+            packet, packet_id = read_login_packet(sock)
             if packet_id == 0x01:
                 return True, "encryption request received (online mode)"
             if packet_id == 0x02:

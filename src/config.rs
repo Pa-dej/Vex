@@ -12,6 +12,8 @@ pub struct Config {
     pub auth: AuthConfig,
     pub forwarding: ForwardingConfig,
     pub limits: LimitsConfig,
+    pub anti_bot: AntiBotConfig,
+    pub reputation: ReputationConfig,
     pub health: HealthConfig,
     pub observability: ObservabilityConfig,
     pub admin: AdminConfig,
@@ -27,6 +29,8 @@ impl Default for Config {
             auth: AuthConfig::default(),
             forwarding: ForwardingConfig::default(),
             limits: LimitsConfig::default(),
+            anti_bot: AntiBotConfig::default(),
+            reputation: ReputationConfig::default(),
             health: HealthConfig::default(),
             observability: ObservabilityConfig::default(),
             admin: AdminConfig::default(),
@@ -177,6 +181,50 @@ impl Default for LimitsConfig {
             handshake_timeout_ms: 2_000,
             login_timeout_ms: 4_000,
             max_packet_size: 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AntiBotConfig {
+    pub enabled: bool,
+    pub attack_cps_threshold: u32,
+    pub attack_login_fail_ratio: f64,
+    pub attack_unique_ip_threshold: usize,
+}
+
+impl Default for AntiBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            attack_cps_threshold: 100,
+            attack_login_fail_ratio: 0.5,
+            attack_unique_ip_threshold: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReputationConfig {
+    pub enabled: bool,
+    pub decay_interval_secs: u64,
+    pub cleanup_timeout_secs: u64,
+    pub block_duration_first_secs: u64,
+    pub block_duration_second_secs: u64,
+    pub block_duration_max_secs: u64,
+}
+
+impl Default for ReputationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            decay_interval_secs: 60,
+            cleanup_timeout_secs: 600,
+            block_duration_first_secs: 30,
+            block_duration_second_secs: 120,
+            block_duration_max_secs: 600,
         }
     }
 }

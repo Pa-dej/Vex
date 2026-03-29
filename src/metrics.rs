@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -25,7 +25,13 @@ pub struct Metrics {
     backend_reconnects_total: IntCounterVec,
     ratelimit_hits_total: IntCounterVec,
     reputation_score_histogram: Histogram,
+    reputation_blocks_total: IntCounterVec,
+    reputation_delays_total: IntCounterVec,
     protocol_versions_total: IntCounterVec,
+    attack_mode_active: IntGauge,
+    attack_detections_total: IntCounter,
+    unique_ips_per_minute: IntGauge,
+    connections_per_second: IntGauge,
     process_memory_bytes: IntGauge,
     tokio_tasks_active: IntGauge,
 }
@@ -184,6 +190,30 @@ impl Metrics {
         )?;
         registry.register(Box::new(reputation_score_histogram.clone()))?;
 
+        let reputation_blocks_total = IntCounterVec::new(
+            Opts::new(
+                "vex_reputation_blocks_total",
+                "Reputation-based blocks partitioned by block duration tier",
+            ),
+            &["duration"],
+        )?;
+        registry.register(Box::new(reputation_blocks_total.clone()))?;
+        for duration in ["30s", "2min", "10min"] {
+            let _ = reputation_blocks_total.with_label_values(&[duration]);
+        }
+
+        let reputation_delays_total = IntCounterVec::new(
+            Opts::new(
+                "vex_reputation_delays_total",
+                "Reputation-based delayed connections partitioned by delay tier",
+            ),
+            &["tier"],
+        )?;
+        registry.register(Box::new(reputation_delays_total.clone()))?;
+        for tier in ["200ms", "500ms"] {
+            let _ = reputation_delays_total.with_label_values(&[tier]);
+        }
+
         let protocol_versions_total = IntCounterVec::new(
             Opts::new(
                 "vex_protocol_versions_total",
@@ -192,6 +222,30 @@ impl Metrics {
             &["version"],
         )?;
         registry.register(Box::new(protocol_versions_total.clone()))?;
+
+        let attack_mode_active = IntGauge::with_opts(Opts::new(
+            "vex_attack_mode_active",
+            "Attack mode state encoded as 1=active,0=inactive",
+        ))?;
+        registry.register(Box::new(attack_mode_active.clone()))?;
+
+        let attack_detections_total = IntCounter::with_opts(Opts::new(
+            "vex_attack_detections_total",
+            "Total attack mode detections",
+        ))?;
+        registry.register(Box::new(attack_detections_total.clone()))?;
+
+        let unique_ips_per_minute = IntGauge::with_opts(Opts::new(
+            "vex_unique_ips_per_minute",
+            "Observed unique source IP addresses in the current 60s window",
+        ))?;
+        registry.register(Box::new(unique_ips_per_minute.clone()))?;
+
+        let connections_per_second = IntGauge::with_opts(Opts::new(
+            "vex_connections_per_second",
+            "Observed connections in the current second",
+        ))?;
+        registry.register(Box::new(connections_per_second.clone()))?;
 
         let process_memory_bytes = IntGauge::with_opts(Opts::new(
             "vex_process_memory_bytes",
@@ -222,7 +276,13 @@ impl Metrics {
             backend_reconnects_total,
             ratelimit_hits_total,
             reputation_score_histogram,
+            reputation_blocks_total,
+            reputation_delays_total,
             protocol_versions_total,
+            attack_mode_active,
+            attack_detections_total,
+            unique_ips_per_minute,
+            connections_per_second,
             process_memory_bytes,
             tokio_tasks_active,
         })
@@ -320,6 +380,18 @@ impl Metrics {
         self.reputation_score_histogram.observe(score);
     }
 
+    pub fn inc_reputation_block(&self, duration: &str) {
+        self.reputation_blocks_total
+            .with_label_values(&[duration])
+            .inc();
+    }
+
+    pub fn inc_reputation_delay(&self, tier: &str) {
+        self.reputation_delays_total
+            .with_label_values(&[tier])
+            .inc();
+    }
+
     pub fn init_backend_labels(&self, backend: &str) {
         let _ = self
             .backend_latency_seconds
@@ -349,6 +421,22 @@ impl Metrics {
 
     pub fn set_process_memory_bytes(&self, bytes: u64) {
         self.process_memory_bytes.set(bytes as i64);
+    }
+
+    pub fn set_attack_mode_active(&self, active: bool) {
+        self.attack_mode_active.set(i64::from(active as i32));
+    }
+
+    pub fn inc_attack_detection(&self) {
+        self.attack_detections_total.inc();
+    }
+
+    pub fn set_unique_ips_per_minute(&self, unique_ips: usize) {
+        self.unique_ips_per_minute.set(unique_ips as i64);
+    }
+
+    pub fn set_connections_per_second(&self, cps: u32) {
+        self.connections_per_second.set(cps as i64);
     }
 
     pub fn set_tokio_tasks_active(&self, tasks: u64) {
@@ -469,7 +557,13 @@ mod tests {
             "vex_backend_reconnects_total",
             "vex_ratelimit_hits_total",
             "vex_reputation_score_histogram",
+            "vex_reputation_blocks_total",
+            "vex_reputation_delays_total",
             "vex_protocol_versions_total",
+            "vex_attack_mode_active",
+            "vex_attack_detections_total",
+            "vex_unique_ips_per_minute",
+            "vex_connections_per_second",
             "vex_process_memory_bytes",
             "vex_tokio_tasks_active",
         ];
