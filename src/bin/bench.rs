@@ -37,6 +37,9 @@ const CONFIG_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 struct Cli {
     #[arg(long, default_value = "127.0.0.1:25577")]
     target: String,
+    /// Host to use in handshake packet (must match Gate route)
+    #[arg(long, default_value = "127.0.0.1")]
+    handshake_host: String,
     #[arg(long, default_value_t = 200)]
     players: u32,
     #[arg(long, default_value_t = 10)]
@@ -190,6 +193,7 @@ async fn main() -> Result<()> {
                 username,
                 cli_clone.protocol,
                 &cli_clone.target,
+                &cli_clone.handshake_host,
                 hold_until,
                 stats_clone,
             )
@@ -258,12 +262,13 @@ async fn run_player(
     username: String,
     protocol: i32,
     target: &str,
+    handshake_host: &str,
     hold_until: Instant,
     stats: Arc<Stats>,
 ) -> Result<()> {
     stats.inc_connecting();
 
-    let (connect_target, handshake_host, handshake_port) = resolve_target(target)?;
+    let (connect_target, _, handshake_port) = resolve_target(target)?;
     let connect_result = tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(connect_target.as_str()),
@@ -285,12 +290,18 @@ async fn run_player(
 
     write_packet(
         &mut stream,
-        &build_handshake(protocol, &handshake_host, handshake_port, 2),
+        &build_handshake(protocol, handshake_host, handshake_port, 2),
         None,
         &stats,
     )
     .await?;
-    write_packet(&mut stream, &build_login_start(&username), None, &stats).await?;
+    write_packet(
+        &mut stream,
+        &build_login_start(&username, protocol),
+        None,
+        &stats,
+    )
+    .await?;
 
     let mut compression_threshold: Option<i32> = None;
     loop {
@@ -656,13 +667,17 @@ fn build_handshake(protocol: i32, host: &str, port: u16, next_state: i32) -> Vec
     payload
 }
 
-fn build_login_start(username: &str) -> Vec<u8> {
+fn build_login_start(username: &str, protocol: i32) -> Vec<u8> {
     let username_bytes = username.as_bytes();
-    let mut payload = Vec::with_capacity(username_bytes.len() + 24);
+    let mut payload = Vec::with_capacity(username_bytes.len() + 10);
     payload.extend_from_slice(&encode_varint(0));
     payload.extend_from_slice(&encode_varint(username_bytes.len() as i32));
     payload.extend_from_slice(username_bytes);
-    payload.extend_from_slice(&[0u8; 16]);
+    if protocol >= 764 {
+        payload.push(0);
+    } else if protocol == 763 {
+        payload.push(0);
+    }
     payload
 }
 

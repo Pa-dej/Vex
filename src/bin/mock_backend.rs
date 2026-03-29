@@ -49,6 +49,8 @@ struct Cli {
     bind: String,
     #[arg(long, default_value = "test-secret-123")]
     secret: String,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    velocity: bool,
     #[arg(long, default_value_t = 256)]
     compression: i32,
 }
@@ -107,8 +109,8 @@ async fn main() -> Result<()> {
     let secret = Arc::new(cli.secret);
 
     println!(
-        "mock_backend listening on {} (compression={}, velocity_secret=***)",
-        cli.bind, cli.compression
+        "mock_backend listening on {} (compression={}, velocity_enabled={}, velocity_secret=***)",
+        cli.bind, cli.compression, cli.velocity
     );
 
     let reporter_stats = stats.clone();
@@ -121,9 +123,10 @@ async fn main() -> Result<()> {
         let stats = stats.clone();
         let secret = secret.clone();
         let compression = cli.compression;
+        let velocity = cli.velocity;
         tokio::spawn(async move {
             if let Err(err) =
-                handle_connection(stream, peer, secret, compression, stats.clone()).await
+                handle_connection(stream, peer, secret, compression, velocity, stats.clone()).await
             {
                 eprintln!("connection error peer={peer}: {err:#}");
             }
@@ -150,6 +153,7 @@ async fn handle_connection(
     peer: SocketAddr,
     secret: Arc<String>,
     compression_threshold: i32,
+    velocity_enabled: bool,
     stats: Arc<Stats>,
 ) -> Result<()> {
     stats.total_accepted.fetch_add(1, Ordering::Relaxed);
@@ -182,24 +186,26 @@ async fn handle_connection(
     let username = parse_login_start(&login_start_packet)
         .map_err(|err| login_failure(&stats, format!("bad login start: {err:#}")))?;
 
-    let plugin_request = build_login_plugin_request(1, "velocity:player_info");
-    write_packet(&mut stream, &plugin_request, compression)
-        .await
-        .context("failed sending velocity plugin request")?;
+    if velocity_enabled {
+        let plugin_request = build_login_plugin_request(1, "velocity:player_info");
+        write_packet(&mut stream, &plugin_request, compression)
+            .await
+            .context("failed sending velocity plugin request")?;
 
-    let plugin_response_packet = read_packet(&mut stream, compression)
-        .await
-        .context("failed reading velocity plugin response")?;
-    let plugin_response = parse_login_plugin_response(&plugin_response_packet)
-        .map_err(|err| login_failure(&stats, format!("bad velocity response: {err:#}")))?;
-    if plugin_response.message_id != 1 || !plugin_response.successful {
-        return Err(login_failure(
-            &stats,
-            "velocity plugin response rejected".to_string(),
-        ));
+        let plugin_response_packet = read_packet(&mut stream, compression)
+            .await
+            .context("failed reading velocity plugin response")?;
+        let plugin_response = parse_login_plugin_response(&plugin_response_packet)
+            .map_err(|err| login_failure(&stats, format!("bad velocity response: {err:#}")))?;
+        if plugin_response.message_id != 1 || !plugin_response.successful {
+            return Err(login_failure(
+                &stats,
+                "velocity plugin response rejected".to_string(),
+            ));
+        }
+        verify_velocity_forwarding_data(secret.as_bytes(), &plugin_response.data, &username)
+            .map_err(|err| login_failure(&stats, format!("velocity verify failed: {err:#}")))?;
     }
-    verify_velocity_forwarding_data(secret.as_bytes(), &plugin_response.data, &username)
-        .map_err(|err| login_failure(&stats, format!("velocity verify failed: {err:#}")))?;
 
     let set_compression = build_set_compression_packet(compression_threshold);
     write_packet(&mut stream, &set_compression, compression)
