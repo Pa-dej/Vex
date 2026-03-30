@@ -79,16 +79,16 @@ All protected endpoints require `x-admin-token`.
 
 ## 4) Plugin API (v3.0-beta) - Hello World
 
-Plugins are Rust dynamic libraries (`.dll`, `.so`, `.dylib`) that link against the stable SDK in `src/sdk/`.
+Plugins are Rust dynamic libraries (`.dll`, `.so`, `.dylib`) that link against the standalone `vex-proxy-sdk` crate (local path `vex-sdk/` in this repo).
 
 Minimal plugin skeleton:
 
 ```rust
 use std::error::Error;
 use std::sync::Arc;
-use vex_sdk::VexPlugin;
-use vex_sdk::api::PluginApi;
-use vex_sdk::event::OnLoginSuccess;
+use vex_proxy_sdk::VexPlugin;
+use vex_proxy_sdk::api::PluginApi;
+use vex_proxy_sdk::event::OnLoginSuccess;
 
 struct HelloPlugin;
 

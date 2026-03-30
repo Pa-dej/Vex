@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
-use vex_sdk::event::{HealthState, OnBackendHealthChange};
-use vex_sdk::server::{BackendInfo, BackendRef};
+use vex_proxy_sdk::event::{HealthState, OnBackendHealthChange};
+use vex_proxy_sdk::server::{BackendInfo, BackendRef};
 
 use crate::mc::{
     build_handshake_packet, build_status_request, parse_packet_id, read_packet, write_packet,
@@ -186,7 +186,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::timeout;
-    use vex_sdk::event::{HealthState, OnBackendHealthChange};
+    use vex_proxy_sdk::event::{HealthState, OnBackendHealthChange};
 
     use super::spawn_health_checker;
     use crate::backend::BackendPool;

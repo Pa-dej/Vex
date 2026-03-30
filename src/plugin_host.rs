@@ -8,17 +8,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 use notify::{RecursiveMode, Watcher};
 use prometheus::Registry;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{error, info, warn};
-use vex_sdk::VexPlugin;
-use vex_sdk::api::{
+use vex_proxy_sdk::api::{
     CommandRegistry, EventBus, MetricsHandle, PluginApi, PluginLogger, ProxyHandle,
 };
-use vex_sdk::event::OnReload;
+use vex_proxy_sdk::event::OnReload;
+use vex_proxy_sdk::{VEX_SDK_VERSION, VexPlugin};
 
 type CreatePluginFn = unsafe extern "C" fn() -> Box<dyn VexPlugin>;
 
@@ -162,6 +162,28 @@ impl PluginHost {
             Library::new(plugin_path)
         }
         .with_context(|| format!("failed opening plugin dylib {}", plugin_path.display()))?;
+
+        let plugin_sdk_version = {
+            let symbol: Symbol<u32> = unsafe {
+                // SAFETY: Symbol type and name are part of the plugin ABI contract.
+                lib.get(b"VEX_SDK_VERSION")
+            }
+            .with_context(|| {
+                format!(
+                    "symbol VEX_SDK_VERSION not found in {}",
+                    plugin_path.display()
+                )
+            })?;
+            *symbol
+        };
+        if plugin_sdk_version != VEX_SDK_VERSION {
+            bail!(
+                "sdk ABI mismatch for {}: proxy={}, plugin={}",
+                plugin_path.display(),
+                VEX_SDK_VERSION,
+                plugin_sdk_version
+            );
+        }
 
         let constructor: Symbol<CreatePluginFn> = unsafe {
             // SAFETY: Symbol type and name are part of the plugin ABI contract.
@@ -356,9 +378,9 @@ mod tests {
 
     use prometheus::Registry;
     use uuid::Uuid;
-    use vex_sdk::api::{CommandRegistry, ProxyHandle, ProxyOps};
-    use vex_sdk::player::ProxiedPlayer;
-    use vex_sdk::server::BackendRef;
+    use vex_proxy_sdk::api::{CommandRegistry, ProxyHandle, ProxyOps};
+    use vex_proxy_sdk::player::ProxiedPlayer;
+    use vex_proxy_sdk::server::BackendRef;
 
     use super::{PluginHost, build_reload_plan};
 
@@ -409,7 +431,9 @@ mod tests {
     #[tokio::test]
     async fn reload_works_with_empty_plugin_directory() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let event_bus = Arc::new(vex_sdk::api::EventBus::new(Duration::from_millis(500)));
+        let event_bus = Arc::new(vex_proxy_sdk::api::EventBus::new(Duration::from_millis(
+            500,
+        )));
         let proxy = Arc::new(ProxyHandle::new(Arc::new(EmptyProxyOps)));
         let commands = Arc::new(CommandRegistry::new());
         let metrics_registry = Arc::new(Registry::new());

@@ -5,8 +5,8 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
-use vex_sdk::player::TransferResult;
-use vex_sdk::server::BackendRef;
+use vex_proxy_sdk::player::TransferResult;
+use vex_proxy_sdk::server::BackendRef;
 
 use crate::mc::{build_handshake_packet, build_login_start_packet, write_packet};
 use crate::session_registry::{RelayCommand, SessionRegistry};
@@ -168,9 +168,9 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot};
     use uuid::Uuid;
-    use vex_sdk::meta::PlayerMeta;
-    use vex_sdk::player::ProxiedPlayer;
-    use vex_sdk::server::{BackendInfo, BackendRef};
+    use vex_proxy_sdk::meta::PlayerMeta;
+    use vex_proxy_sdk::player::ProxiedPlayer;
+    use vex_proxy_sdk::server::{BackendInfo, BackendRef};
 
     use super::*;
     use crate::mc::read_packet;

@@ -8,8 +8,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
-use vex_sdk::api::CommandSender;
-use vex_sdk::event::OnReload;
+use vex_proxy_sdk::api::CommandSender;
+use vex_proxy_sdk::event::OnReload;
 
 use crate::backend::BackendHealth;
 use crate::config::{AuthMode, Config};
@@ -274,7 +274,7 @@ mod tests {
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
     use tempfile::tempdir;
-    use vex_sdk::api::MetricsHandle;
+    use vex_proxy_sdk::api::MetricsHandle;
 
     use super::*;
     use crate::backend::BackendPool;

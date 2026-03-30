@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bytes = "1.10"
-vex_sdk = { package = "Vex", path = "../.." }
+vex-proxy-sdk = { path = "../../vex-sdk", features = ["metrics"] }

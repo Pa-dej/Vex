@@ -1,9 +1,11 @@
+#![allow(improper_ctypes_definitions)] // Plugin ABI intentionally uses Box<dyn VexPlugin> at extern boundary.
+
 use std::error::Error;
 use std::sync::Arc;
 
-use vex_sdk::VexPlugin;
-use vex_sdk::api::{CommandSender, PluginApi};
-use vex_sdk::event::{
+use vex_proxy_sdk::VexPlugin;
+use vex_proxy_sdk::api::{CommandSender, PluginApi};
+use vex_proxy_sdk::event::{
     OnAttackModeChange, OnBackendConnect, OnBackendDisconnect, OnBackendHealthChange,
     OnBackendReady, OnBackendSwitch, OnDisconnect, OnHandshake, OnPluginMessage, OnPreLogin,
     OnReload, OnStatusPing, OnTcpConnect,
@@ -100,3 +102,6 @@ impl VexPlugin for HelloPlugin {
 pub extern "C" fn vex_plugin_create() -> Box<dyn VexPlugin> {
     Box::new(HelloPlugin)
 }
+
+#[unsafe(no_mangle)]
+pub static VEX_SDK_VERSION: u32 = vex_proxy_sdk::VEX_SDK_VERSION;

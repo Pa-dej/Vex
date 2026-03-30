@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use vex_sdk::api::EventBus;
+pub use vex_proxy_sdk::api::EventBus;
 
 #[cfg(test)]
 mod tests {
@@ -7,7 +7,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use vex_sdk::event::{Cancellation, Event};
+    use vex_proxy_sdk::event::{Cancellation, Event};
 
     use super::EventBus;
 

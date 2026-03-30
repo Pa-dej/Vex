@@ -5,10 +5,10 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
-use vex_sdk::api::{CommandRegistry, EventBus, ProxyHandle, ProxyOps};
-use vex_sdk::event::OnPermissionCheck;
-use vex_sdk::player::ProxiedPlayer;
-use vex_sdk::server::{BackendInfo, BackendRef};
+use vex_proxy_sdk::api::{CommandRegistry, EventBus, ProxyHandle, ProxyOps};
+use vex_proxy_sdk::event::OnPermissionCheck;
+use vex_proxy_sdk::player::ProxiedPlayer;
+use vex_proxy_sdk::server::{BackendInfo, BackendRef};
 
 use crate::analytics::AttackAnalytics;
 use crate::auth_circuit::AuthCircuitBreaker;

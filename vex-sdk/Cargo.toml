@@ -1,0 +1,22 @@
+[package]
+name = "vex-proxy-sdk"
+version = "0.1.1"
+edition = "2021"
+description = "Plugin SDK for the Vex Minecraft proxy"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pa-dej/Vex"
+keywords = ["minecraft", "proxy", "plugin", "sdk", "vex"]
+categories = ["game-engines", "network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+bytes = "1"
+dashmap = "6.1"
+thiserror = "2.0"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+prometheus = { version = "0.14", optional = true }
+
+[features]
+default = []
+metrics = ["prometheus"]

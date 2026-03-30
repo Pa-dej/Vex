@@ -2,10 +2,11 @@
 name = "Vex"
 version = "0.1.0"
 edition = "2024"
-
-[lib]
-name = "vex_sdk"
-path = "src/sdk/mod.rs"
+description = "High-performance Minecraft proxy with plugin support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pa-dej/Vex"
+keywords = ["minecraft", "proxy", "network", "tokio", "vex"]
+categories = ["game-engines", "network-programming"]
 
 [[bin]]
 name = "bench"
@@ -45,10 +46,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sysinfo = "0.32"
 uuid = { version = "1", features = ["v3"] }
+vex-proxy-sdk = { version = "0.1.1", path = "vex-sdk", features = ["metrics"] }
 
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
 
 [workspace]
-members = [".", "examples/hello_plugin"]
+members = [".", "vex-sdk", "examples/hello_plugin"]

@@ -6,9 +6,9 @@ use dashmap::DashMap;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use vex_sdk::meta::PlayerMeta;
-use vex_sdk::player::{PlayerHooks, ProxiedPlayer};
-use vex_sdk::server::BackendRef;
+use vex_proxy_sdk::meta::PlayerMeta;
+use vex_proxy_sdk::player::{PlayerHooks, ProxiedPlayer};
+use vex_proxy_sdk::server::BackendRef;
 
 #[derive(Debug)]
 pub enum RelayCommand {
@@ -223,8 +223,8 @@ mod tests {
     use bytes::Bytes;
     use tokio::sync::mpsc;
     use uuid::Uuid;
-    use vex_sdk::meta::PlayerMeta;
-    use vex_sdk::player::ProxiedPlayer;
+    use vex_proxy_sdk::meta::PlayerMeta;
+    use vex_proxy_sdk::player::ProxiedPlayer;
 
     use super::*;
 

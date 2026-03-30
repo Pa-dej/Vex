@@ -15,14 +15,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::time::timeout;
 use tracing::{Instrument, debug, error, info, info_span, warn};
-use vex_sdk::event::{
+use vex_proxy_sdk::event::{
     DisconnectReason, OnAttackModeChange, OnBackendConnect, OnBackendDisconnect, OnBackendKick,
     OnBackendReady, OnBackendSwitch, OnDisconnect, OnHandshake, OnLoginSuccess, OnPluginMessage,
     OnPreLogin, OnStatusPing, OnTcpConnect, SamplePlayer, StatusResponse,
 };
-use vex_sdk::meta::PlayerMeta;
-use vex_sdk::player::ProxiedPlayer;
-use vex_sdk::server::{BackendInfo, BackendRef};
+use vex_proxy_sdk::meta::PlayerMeta;
+use vex_proxy_sdk::player::ProxiedPlayer;
+use vex_proxy_sdk::server::{BackendInfo, BackendRef};
 
 use crate::analytics::AttackUpdate;
 use crate::auth_circuit::CircuitState;
@@ -30,14 +30,13 @@ use crate::config::AuthMode;
 use crate::limiter::AcquireRejectReason;
 use crate::mc::{
     EncryptionResponse, VelocityProperty, build_encryption_request, build_login_disconnect,
-    build_login_plugin_response, build_play_plugin_message_packet,
-    build_play_system_chat_packet, build_respawn_packet,
-    build_signed_velocity_forwarding_data, build_status_ping_response, build_status_response,
-    build_velocity_modern_forwarding_payload, decode_login_packet_from_backend,
-    encode_login_packet_for_backend, offline_uuid, parse_encryption_response, parse_handshake,
-    parse_login_plugin_request, parse_login_start_username, parse_packet_id,
-    parse_play_plugin_message_packet, parse_set_compression_threshold, parse_varint, read_packet,
-    write_packet, write_varint,
+    build_login_plugin_response, build_play_plugin_message_packet, build_play_system_chat_packet,
+    build_respawn_packet, build_signed_velocity_forwarding_data, build_status_ping_response,
+    build_status_response, build_velocity_modern_forwarding_payload,
+    decode_login_packet_from_backend, encode_login_packet_for_backend, offline_uuid,
+    parse_encryption_response, parse_handshake, parse_login_plugin_request,
+    parse_login_start_username, parse_packet_id, parse_play_plugin_message_packet,
+    parse_set_compression_threshold, parse_varint, read_packet, write_packet, write_varint,
 };
 use crate::reputation::{ReputationAction, connection_block_message};
 use crate::session_registry::{PlayerSession, RelayCommand};
@@ -2252,10 +2251,9 @@ async fn handle_relay_command_during_kick_plain(
         RelayCommand::PluginMessage { channel, data } => {
             if let Some(packet) =
                 build_internal_clientbound_message_packet(player, channel.as_ref(), &data)
+                && let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet)
             {
-                if let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet) {
-                    let _ = write_packet(client, &encoded).await;
-                }
+                let _ = write_packet(client, &encoded).await;
             }
         }
     }
@@ -2302,10 +2300,9 @@ async fn handle_relay_command_during_kick_encrypted(
         RelayCommand::PluginMessage { channel, data } => {
             if let Some(packet) =
                 build_internal_clientbound_message_packet(player, channel.as_ref(), &data)
+                && let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet)
             {
-                if let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet) {
-                    let _ = write_client_packet(client, &encoded, Some(client_crypto)).await;
-                }
+                let _ = write_client_packet(client, &encoded, Some(client_crypto)).await;
             }
         }
     }
@@ -3171,8 +3168,11 @@ mod tests {
                         let transfer_result =
                             tokio::task::spawn_blocking(move || player.transfer(target))
                                 .await
-                                .unwrap_or(vex_sdk::player::TransferResult::Timeout);
-                        if matches!(transfer_result, vex_sdk::player::TransferResult::Success) {
+                                .unwrap_or(vex_proxy_sdk::player::TransferResult::Timeout);
+                        if matches!(
+                            transfer_result,
+                            vex_proxy_sdk::player::TransferResult::Success
+                        ) {
                             transfer_successes_handler.fetch_add(1, Ordering::Relaxed);
                             event.cancel("redirected to backend-2");
                         }
@@ -3350,7 +3350,7 @@ mod tests {
 
         let started = Instant::now();
         let result = tokio::task::spawn_blocking(move || player.transfer(backend2_ref)).await?;
-        assert_eq!(result, vex_sdk::player::TransferResult::Success);
+        assert_eq!(result, vex_proxy_sdk::player::TransferResult::Success);
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "transfer exceeded 500ms: {:?}",
@@ -3470,7 +3470,7 @@ mod tests {
 
         let started = Instant::now();
         let result = tokio::task::spawn_blocking(move || player.transfer(backend2_ref)).await?;
-        assert_eq!(result, vex_sdk::player::TransferResult::Timeout);
+        assert_eq!(result, vex_proxy_sdk::player::TransferResult::Timeout);
         assert!(
             started.elapsed() <= Duration::from_millis(550),
             "timeout exceeded expected cap: {:?}",
