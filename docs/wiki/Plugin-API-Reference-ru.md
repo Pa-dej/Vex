@@ -94,6 +94,6 @@ api.events.on::<OnPreLogin, _, _>(move |event| async move {
 | `set_tab_list` | Заголовок/футер таба. |
 
 ## See also
-- [Разработка плагинов](Plugin-Development-ru.md)
-- [Конфигурация](Configuration-ru.md)
-- [Home](Home-ru.md)
+- [Разработка плагинов](Plugin-Development-ru)
+- [Конфигурация](Configuration-ru)
+- [Home](Home-ru)

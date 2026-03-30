@@ -348,7 +348,7 @@ pubsub_channel = "vex.cluster"
 ```
 
 ## See also
-- [Быстрый старт](Getting-Started-ru.md)
-- [Кластеризация](Clustering-ru.md)
-- [Антибот](Anti-Bot-ru.md)
-- [Home](Home-ru.md)
+- [Быстрый старт](Getting-Started-ru)
+- [Кластеризация](Clustering-ru)
+- [Антибот](Anti-Bot-ru)
+- [Home](Home-ru)

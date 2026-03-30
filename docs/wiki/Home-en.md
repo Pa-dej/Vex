@@ -78,16 +78,16 @@ After test (memory retained): Vex 14 MB, Gate 22 MB, BungeeCord 707 MB.
 - Auth via x-admin-token header
 
 ## Quick links
-- [Getting Started](Getting-Started-en.md)
-- [Configuration Reference](Configuration-en.md)
-- [Plugin Development](Plugin-Development-en.md)
-- [Plugin API Reference](Plugin-API-Reference-en.md)
-- [Anti-Bot](Anti-Bot-en.md)
-- [Clustering](Clustering-en.md)
-- [Observability](Observability-en.md)
-- [Comparison](Comparison-en.md)
-- [Changelog](Changelog-en.md)
+- [Getting Started](Getting-Started-en)
+- [Configuration Reference](Configuration-en)
+- [Plugin Development](Plugin-Development-en)
+- [Plugin API Reference](Plugin-API-Reference-en)
+- [Anti-Bot](Anti-Bot-en)
+- [Clustering](Clustering-en)
+- [Observability](Observability-en)
+- [Comparison](Comparison-en)
+- [Changelog](Changelog-en)
 
 ## See also
-- [Home (RU)](Home-ru.md)
-- [README](../../README.md)
+- [Home (RU)](Home-ru)
+- [Repository](https://github.com/Pa-dej/Vex)

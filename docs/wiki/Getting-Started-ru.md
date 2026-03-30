@@ -87,7 +87,7 @@ ok
 - **Порт занят**: измените `[listener].bind` или `[admin].bind`.
 
 ## See also
-- [Конфигурация](Configuration-ru.md)
-- [Антибот](Anti-Bot-ru.md)
-- [Наблюдаемость](Observability-ru.md)
-- [Home](Home-ru.md)
+- [Конфигурация](Configuration-ru)
+- [Антибот](Anti-Bot-ru)
+- [Наблюдаемость](Observability-ru)
+- [Home](Home-ru)

@@ -39,5 +39,5 @@
 - Degraded mode and Redis circuit breaker
 
 ## See also
-- [Home](Home-en.md)
-- [Comparison](Comparison-en.md)
+- [Home](Home-en)
+- [Comparison](Comparison-en)

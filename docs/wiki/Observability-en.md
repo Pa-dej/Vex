@@ -87,6 +87,6 @@ Every connection gets a `trace_id` which appears in logs and spans:
 Plugins can register metrics with the Metrics API. Metric names are prefixed with `vex_plugin_<plugin>_...` and are removed when a plugin unloads.
 
 ## See also
-- [Configuration Reference](Configuration-en.md)
-- [Plugin Development](Plugin-Development-en.md)
-- [Home](Home-en.md)
+- [Configuration Reference](Configuration-en)
+- [Plugin Development](Plugin-Development-en)
+- [Home](Home-en)

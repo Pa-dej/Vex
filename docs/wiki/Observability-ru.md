@@ -87,6 +87,6 @@ log_level = "info"
 Плагины могут регистрировать метрики через Metrics API. Имена имеют префикс `vex_plugin_<plugin>_...` и удаляются при выгрузке плагина.
 
 ## See also
-- [Конфигурация](Configuration-ru.md)
-- [Разработка плагинов](Plugin-Development-ru.md)
-- [Home](Home-ru.md)
+- [Конфигурация](Configuration-ru)
+- [Разработка плагинов](Plugin-Development-ru)
+- [Home](Home-ru)

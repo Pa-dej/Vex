@@ -112,7 +112,7 @@ services:
 ```
 
 ## See also
-- [Антибот](Anti-Bot-ru.md)
-- [Конфигурация](Configuration-ru.md)
-- [Наблюдаемость](Observability-ru.md)
-- [Home](Home-ru.md)
+- [Антибот](Anti-Bot-ru)
+- [Конфигурация](Configuration-ru)
+- [Наблюдаемость](Observability-ru)
+- [Home](Home-ru)

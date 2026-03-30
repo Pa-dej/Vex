@@ -173,7 +173,7 @@ pub extern "C" fn vex_plugin_create() -> Box<dyn VexPlugin> {
 ```
 
 ## See also
-- [Plugin API Reference](Plugin-API-Reference-en.md)
-- [Configuration Reference](Configuration-en.md)
-- [Getting Started](Getting-Started-en.md)
-- [Home](Home-en.md)
+- [Plugin API Reference](Plugin-API-Reference-en)
+- [Configuration Reference](Configuration-en)
+- [Getting Started](Getting-Started-en)
+- [Home](Home-en)

@@ -89,7 +89,7 @@ block_duration_3_secs = 600
 ```
 
 ## See also
-- [Конфигурация](Configuration-ru.md)
-- [Кластеризация](Clustering-ru.md)
-- [Наблюдаемость](Observability-ru.md)
-- [Home](Home-ru.md)
+- [Конфигурация](Configuration-ru)
+- [Кластеризация](Clustering-ru)
+- [Наблюдаемость](Observability-ru)
+- [Home](Home-ru)

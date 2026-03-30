@@ -78,16 +78,16 @@
 - Авторизация через x-admin-token
 
 ## Быстрые ссылки
-- [Быстрый старт](Getting-Started-ru.md)
-- [Конфигурация](Configuration-ru.md)
-- [Разработка плагинов](Plugin-Development-ru.md)
-- [Plugin API Reference](Plugin-API-Reference-ru.md)
-- [Антибот](Anti-Bot-ru.md)
-- [Кластеризация](Clustering-ru.md)
-- [Наблюдаемость](Observability-ru.md)
-- [Сравнение](Comparison-ru.md)
-- [История версий](Changelog-ru.md)
+- [Быстрый старт](Getting-Started-ru)
+- [Конфигурация](Configuration-ru)
+- [Разработка плагинов](Plugin-Development-ru)
+- [Plugin API Reference](Plugin-API-Reference-ru)
+- [Антибот](Anti-Bot-ru)
+- [Кластеризация](Clustering-ru)
+- [Наблюдаемость](Observability-ru)
+- [Сравнение](Comparison-ru)
+- [История версий](Changelog-ru)
 
 ## See also
-- [Home (EN)](Home-en.md)
-- [README](../../README.md)
+- [Home (EN)](Home-en)
+- [Repository](https://github.com/Pa-dej/Vex)

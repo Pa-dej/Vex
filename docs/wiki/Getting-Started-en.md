@@ -87,7 +87,7 @@ ok
 - **Port already in use**: change `[listener].bind` or `[admin].bind`.
 
 ## See also
-- [Configuration Reference](Configuration-en.md)
-- [Anti-Bot](Anti-Bot-en.md)
-- [Observability](Observability-en.md)
-- [Home](Home-en.md)
+- [Configuration Reference](Configuration-en)
+- [Anti-Bot](Anti-Bot-en)
+- [Observability](Observability-en)
+- [Home](Home-en)

@@ -40,6 +40,6 @@ Choose Vex if:
 - You want native Rust plugin development and hot reload.
 
 ## See also
-- [Home](Home-en.md)
-- [Benchmark](Home-en.md#benchmark-10000-concurrent-connections)
-- [Changelog](Changelog-en.md)
+- [Home](Home-en)
+- [Benchmark](Home-en#benchmark-10000-concurrent-connections)
+- [Changelog](Changelog-en)

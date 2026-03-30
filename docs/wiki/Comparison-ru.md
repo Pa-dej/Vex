@@ -40,6 +40,6 @@
 - Хотите писать нативные плагины на Rust и использовать hot reload.
 
 ## See also
-- [Home](Home-ru.md)
-- [Benchmark](Home-ru.md#бенчмарк-10-000-одновременных-подключений)
-- [История версий](Changelog-ru.md)
+- [Home](Home-ru)
+- [Benchmark](Home-ru#бенчмарк-10-000-одновременных-подключений)
+- [История версий](Changelog-ru)

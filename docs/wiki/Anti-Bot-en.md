@@ -90,7 +90,7 @@ block_duration_3_secs = 600
 ```
 
 ## See also
-- [Configuration Reference](Configuration-en.md)
-- [Clustering](Clustering-en.md)
-- [Observability](Observability-en.md)
-- [Home](Home-en.md)
+- [Configuration Reference](Configuration-en)
+- [Clustering](Clustering-en)
+- [Observability](Observability-en)
+- [Home](Home-en)

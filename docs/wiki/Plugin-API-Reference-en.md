@@ -94,6 +94,6 @@ api.events.on::<OnPreLogin, _, _>(move |event| async move {
 | `set_tab_list` | Tab header/footer. |
 
 ## See also
-- [Plugin Development](Plugin-Development-en.md)
-- [Configuration Reference](Configuration-en.md)
-- [Home](Home-en.md)
+- [Plugin Development](Plugin-Development-en)
+- [Configuration Reference](Configuration-en)
+- [Home](Home-en)

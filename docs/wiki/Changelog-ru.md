@@ -39,5 +39,5 @@
 - Degraded режим и circuit breaker
 
 ## See also
-- [Home](Home-ru.md)
-- [Сравнение](Comparison-ru.md)
+- [Home](Home-ru)
+- [Сравнение](Comparison-ru)
