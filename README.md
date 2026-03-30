@@ -6,7 +6,7 @@
 
 [![language](https://img.shields.io/badge/language-Rust-D07030?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![rust version](https://img.shields.io/badge/rust-1.75+-D07030?style=flat-square)](https://blog.rust-lang.org)
-[![version](https://img.shields.io/badge/version-v4-D07030?style=flat-square)](https://github.com/Pa-dej/Vex/releases)
+[![version](https://img.shields.io/badge/version-0.1.0-D07030?style=flat-square)](https://github.com/Pa-dej/Vex/releases)
 [![plugin sdk](https://img.shields.io/crates/v/vex-proxy-sdk?style=flat-square&label=plugin%20sdk&color=D07030)](https://crates.io/crates/vex-proxy-sdk)
 ![lines of rust](https://img.shields.io/endpoint?style=flat-square&label=lines%20of%20Rust&color=D07030&url=https%3A%2F%2Fghloc.vercel.app%2Fapi%2FPa-dej%2FVex%2Fbadge%3Ffilter%3D.rs%24)
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-D07030?style=flat-square)](LICENSE)
@@ -17,22 +17,24 @@
 
 ## Documentation
 
-- 🇬🇧 English — `docs/wiki/Home-en.md`
+- 🇬🇧 English — `docs/wiki/Home-en.md` (or [GitHub Wiki](https://github.com/Pa-dej/Vex/wiki))
 - 🇷🇺 Русский — `docs/wiki/Home-ru.md`
 
 ---
 
-## Benchmark
+## Benchmark (latest local)
 
-> 10,000 concurrent connections · same host class · resident memory per connection
+> 10,000 concurrent connections · mock_backend · release build (2026-03-30)
 
-| Proxy | Runtime | Memory / conn | vs Vex |
-|---|---|---:|---:|
-| **Vex** | Rust + Tokio | **26 KB** | 1.0× |
-| Gate | Go | 97 KB | 3.7× |
-| BungeeCord | JVM | 153 KB | **5.9×** |
+| Metric | Result |
+|---|---|
+| Success rate | 100% |
+| Peak concurrent logged_in | 10,000 |
+| Vex peak RSS | 291 MB (~29.1 KB/conn) |
+| mock_backend peak RSS | 39.9 MB |
+| Timeouts / rejects | 0 / 0 |
 
-Vex reached 100% successful connection handling in this benchmark profile.
+Historical comparisons (Gate/BungeeCord) live in `PLAN.md` and should be revalidated for official claims.
 
 ---
 
@@ -40,12 +42,12 @@ Vex reached 100% successful connection handling in this benchmark profile.
 
 **1. Start a local backend**
 ```bash
-cargo run --bin mock_backend -- --bind 127.0.0.1:25565 --secret test-secret-123 --velocity true
+cargo run --release --bin mock_backend -- --bind 127.0.0.1:25565 --secret test-secret-123 --velocity true
 ```
 
 **2. Start Vex**
 ```bash
-cargo run --bin Vex
+cargo run --release --bin Vex
 ```
 
 **3. Run smoke checks**
@@ -69,6 +71,12 @@ set PYTHONIOENCODING=utf-8 && python scripts/test_antibot.py
 
 ---
 
+## Protocol support
+
+Supported protocol IDs are listed in `config/protocol_ids.toml` (currently 1.20–1.21.11). The synthetic `bench` tool may lag the newest login packet changes; use real clients or `mock_backend` for load testing on brand-new versions.
+
+---
+
 ## Config Reference
 
 Main config file: `vex.toml`
@@ -79,7 +87,7 @@ Main config file: `vex.toml`
 | `[routing]` | `allow_degraded`, `[[routing.backends]]` | Backend pool and selection behavior |
 | `[auth]` | `mode` (`offline`, `online`, `auto`) | Authentication mode |
 | `[forwarding.velocity]` | `enabled`, `secret` | Velocity modern forwarding |
-| `[limits]` | `max_connections*`, `handshake_timeout_ms`, `login_timeout_ms` | Capacity and protocol safety limits |
+| `[limits]` | `max_connections*`, `handshake_timeout_ms`, `login_timeout_ms` | Capacity, timeouts, memory caps |
 | `[anti_bot]` | `enabled`, `attack_*` thresholds | Attack mode trigger thresholds |
 | `[reputation]` | `decay_interval_secs`, `block_duration_*` | Reputation decay and penalty tuning |
 | `[health]` | `interval_ms`, `status_timeout_ms`, `tcp_timeout_ms` | Backend health probing and transitions |
@@ -88,6 +96,9 @@ Main config file: `vex.toml`
 | `[admin]` | `bind`, `auth_token` | Admin API endpoint and auth |
 | `[shutdown]` | `drain_seconds`, `disconnect_message` | Graceful drain behavior |
 | `[protocol_map]` | `path` | Supported protocol ID table |
+| `[observability]` | `log_level`, `log_format` | Logging + metrics output |
+| `[cluster]` | `enabled`, `node_id` | Clustering (experimental) |
+| `[cluster.redis]` | `url`, `prefix` | Redis transport for cluster |
 
 <details>
 <summary>Admin API endpoints</summary>
@@ -102,14 +113,16 @@ All protected endpoints require `x-admin-token` header.
 | `POST` | `/auth/mode` | Switch auth mode at runtime |
 | `POST` | `/commands/{name}` | Dispatch plugin command |
 | `POST` | `/shutdown` | Graceful shutdown |
+| `GET` | `/cluster/status` | Cluster status |
+| `GET` | `/cluster/nodes` | Cluster node list |
 
 </details>
 
 ---
 
-## Plugin API — v3.0-beta
+## Plugin API — SDK 0.3.x (alpha)
 
-Plugins are Rust dynamic libraries (`.dll` / `.so` / `.dylib`) linked against `vex-proxy-sdk` (local path `vex-sdk/`).
+Plugins are Rust dynamic libraries (`.dll` / `.so` / `.dylib`) linked against `vex-proxy-sdk` (local path `vex-sdk/`). The SDK is evolving; breaking changes may still occur before 1.0.
 
 <details>
 <summary>Hello World plugin</summary>
@@ -125,7 +138,7 @@ struct HelloPlugin;
 
 impl VexPlugin for HelloPlugin {
     fn name(&self) -> &'static str { "hello_plugin" }
-    fn version(&self) -> &'static str { "3.0.0-beta" }
+    fn version(&self) -> &'static str { "0.3.0" }
 
     fn on_load(&self, api: Arc<PluginApi>) -> Result<(), Box<dyn Error + Send + Sync>> {
         api.logger.info("Hello from hello_plugin!");
@@ -157,8 +170,8 @@ cargo build -p hello_plugin --release
 curl -X POST http://127.0.0.1:8080/reload -H "x-admin-token: change-me"
 ```
 
-**What plugins get in v3.0-beta:**
-- Full proxy event surface — connect, handshake, pre-login, backend lifecycle, kick/switch, status ping, reload, attack mode, health transitions, permission checks
+**What plugins get today:**
+- 16 core events — TCP connect, handshake, pre-login, backend lifecycle, kick/switch, status ping, reload, attack mode, health transitions, permission checks
 - Hot reload by file change (`[plugins].watch = true`) with partial reload (changed plugins only)
 - Plugin command registration
 - Per-player typed metadata store
@@ -185,22 +198,20 @@ Rust gives deterministic performance and memory behavior without JVM GC pauses, 
 
 ---
 
-## Roadmap
+## Status & roadmap
 
-| Milestone | Status | Scope |
+| Area | Status | Notes |
 |---|---|---|
-| v1 | ✅ Done | Core proxy, health checks, hot reload, graceful shutdown |
-| v1.1 | ✅ Done | Velocity forwarding, online auth, AES/CFB8, circuit breaker |
-| v1.2 | ✅ Done | Connection caps, token buckets, frame hardening |
-| v2 | ✅ Done | Reputation system, adaptive penalties, attack analytics |
-| v3.0-alpha | ✅ Done | SDK surface, host scaffold, transfer/plugin messaging wiring |
-| v3.0-beta | ✅ Done | Full event set, hot reload improvements, plugin metrics |
-| **v3.0** | 🔜 Next | Release docs, SDK polish, examples, packaging |
-| v3.1 | 📋 Planned | Plugin registry / marketplace |
-| v4 | 📋 Planned | Clustering / synchronized distributed state |
+| Core proxy | ✅ done | Hot reload, health checks, graceful shutdown |
+| Auth + forwarding | ✅ done | Online/offline + Velocity modern forwarding |
+| Anti-bot v2 | ✅ done | Reputation + adaptive penalties |
+| Observability | ✅ done | Prometheus + JSON logs + Grafana |
+| Plugin SDK | 🧪 alpha | `vex-proxy-sdk` 0.3.x |
+| Clustering | 🧪 experimental | Redis-backed state (opt-in) |
+| Docs | 🚧 in progress | Wiki pages under `docs/wiki/` |
 
 ---
 
 <div align="center">
-<sub>This repository ships English (<code>README.md</code>) and Russian (<code>README_RU.md</code>) docs.<br/>Bench numbers are project-reported values from the current development plan and benchmark setup.</sub>
+<sub>This repository ships English (<code>README.md</code>) and Russian (<code>README_RU.md</code>) docs.<br/>Bench numbers above are from the latest local run; historical comparisons live in <code>PLAN.md</code>.</sub>
 </div>
