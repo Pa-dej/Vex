@@ -21,6 +21,7 @@ pub struct Config {
     pub protocol_map: ProtocolMapConfig,
     pub plugins: PluginsConfig,
     pub status: StatusConfig,
+    pub cluster: ClusterConfig,
 }
 
 impl Config {
@@ -324,6 +325,48 @@ impl Default for StatusConfig {
             motd: "§bA §fVex §bProxy".to_string(),
             max_players: 1000,
             show_real_online: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    pub node_id: String,
+    pub node_announce_interval_ms: u64,
+    pub redis: ClusterRedisConfig,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: "node-1".to_string(),
+            node_announce_interval_ms: 5000,
+            redis: ClusterRedisConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClusterRedisConfig {
+    pub url: String,
+    pub prefix: String,
+    pub connect_timeout_ms: u64,
+    pub operation_timeout_ms: u64,
+    pub max_connections: usize,
+}
+
+impl Default for ClusterRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: "redis://127.0.0.1:6379".to_string(),
+            prefix: "vex:".to_string(),
+            connect_timeout_ms: 2000,
+            operation_timeout_ms: 500,
+            max_connections: 16,
         }
     }
 }

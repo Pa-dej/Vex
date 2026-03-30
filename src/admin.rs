@@ -30,6 +30,8 @@ pub async fn run_admin_server(ctx: AdminContext) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/cluster/nodes", get(cluster_nodes))
+        .route("/cluster/status", get(cluster_status))
         .route("/reload", post(reload))
         .route("/auth/mode", post(set_auth_mode))
         .route("/commands/{name}", post(execute_command))
@@ -69,8 +71,33 @@ async fn healthz(State(ctx): State<AdminContext>) -> impl IntoResponse {
         draining: ctx.state.shutdown.is_draining(),
         auth_mode: auth_mode.to_string(),
         backends,
+        cluster: ClusterHealthResponse {
+            clustered: ctx.state.cluster().is_clustered(),
+            node_id: ctx.state.cluster().node_id().to_string(),
+            redis_connected: ctx.state.cluster().redis_connected(),
+            total_nodes: ctx.state.cluster().get_node_list().await.len() as u32,
+            global_online: ctx.state.cluster().get_global_online_count().await as u32,
+        },
     };
     (StatusCode::OK, Json(resp))
+}
+
+async fn cluster_nodes(State(ctx): State<AdminContext>) -> impl IntoResponse {
+    let nodes = ctx.state.cluster().get_node_list().await;
+    (StatusCode::OK, Json(nodes)).into_response()
+}
+
+async fn cluster_status(State(ctx): State<AdminContext>, headers: HeaderMap) -> impl IntoResponse {
+    let _ = headers;
+    let cluster = ctx.state.cluster();
+    let response = ClusterStatusResponse {
+        clustered: cluster.is_clustered(),
+        node_id: cluster.node_id().to_string(),
+        redis_connected: cluster.redis_connected(),
+        total_nodes: cluster.get_node_list().await.len() as u32,
+        global_online: cluster.get_global_online_count().await as u32,
+    };
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn metrics(State(ctx): State<AdminContext>) -> impl IntoResponse {
@@ -262,6 +289,25 @@ struct HealthResponse {
     draining: bool,
     auth_mode: String,
     backends: Vec<BackendHealthView>,
+    cluster: ClusterHealthResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterHealthResponse {
+    clustered: bool,
+    node_id: String,
+    redis_connected: bool,
+    total_nodes: u32,
+    global_online: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterStatusResponse {
+    clustered: bool,
+    node_id: String,
+    redis_connected: bool,
+    total_nodes: u32,
+    global_online: u32,
 }
 
 #[cfg(test)]
@@ -302,7 +348,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
 
         let plugin_runtime = state.plugin_runtime();
         let plugin_host = Arc::new(tokio::sync::Mutex::new(PluginHost::new(
@@ -351,7 +397,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
 
         let plugin_metrics = MetricsHandle::new(state.metrics.registry(), "metrics_plugin");
         let counter = plugin_metrics.register_counter(

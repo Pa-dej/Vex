@@ -17,5 +17,7 @@ pub use crate::meta::{PlayerMeta, PlayerMetaOps};
 pub use crate::player::{ProxiedPlayer, TransferResult};
 pub use crate::plugin_meta::PluginMeta;
 pub use crate::scheduler::{BoxFuture, Scheduler, TaskHandle};
-pub use crate::server::{BackendInfo, BackendRef, HealthState};
+pub use crate::server::{
+    AnyPlayerInfo, BackendInfo, BackendRef, HealthState, NodeInfo, RemotePlayerInfo,
+};
 pub use crate::VexPlugin;

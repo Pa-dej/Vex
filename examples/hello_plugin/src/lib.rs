@@ -132,6 +132,3 @@ tab_footer: "§7Have fun!"
 pub extern "C" fn vex_plugin_create() -> Box<dyn VexPlugin> {
     Box::new(HelloPlugin)
 }
-
-#[unsafe(no_mangle)]
-pub static VEX_SDK_VERSION: u32 = vex_proxy_sdk::VEX_SDK_VERSION;

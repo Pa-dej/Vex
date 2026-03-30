@@ -214,7 +214,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
 
         let (tx, rx) = oneshot::channel::<(String, HealthState, HealthState)>();
         let sender = Arc::new(Mutex::new(Some(tx)));

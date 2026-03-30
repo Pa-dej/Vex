@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -9,6 +10,7 @@ use uuid::Uuid;
 use vex_proxy_sdk::meta::PlayerMeta;
 use vex_proxy_sdk::player::{PlayerHooks, ProxiedPlayer};
 use vex_proxy_sdk::server::BackendRef;
+use vex_proxy_sdk::server::RemotePlayerInfo;
 
 use crate::mc::{
     build_play_actionbar_packet, build_play_chat_message_packet, build_play_tab_list_packet,
@@ -41,6 +43,7 @@ pub struct PlayerSession {
     _meta: PlayerMeta,
     backend: Arc<std::sync::RwLock<Option<BackendRef>>>,
     latency_ms: Arc<AtomicU32>,
+    connected_at: u64,
 }
 
 impl PlayerSession {
@@ -56,6 +59,9 @@ impl PlayerSession {
             _meta: meta,
             backend: Arc::new(std::sync::RwLock::new(backend)),
             latency_ms: Arc::new(AtomicU32::new(0)),
+            connected_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
         }
     }
 
@@ -71,6 +77,10 @@ impl PlayerSession {
 
     pub fn latency_ms(&self) -> u32 {
         self.latency_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn connected_at(&self) -> u64 {
+        self.connected_at
     }
 }
 
@@ -134,6 +144,25 @@ impl SessionRegistry {
                     .unwrap_or(false)
             })
             .count()
+    }
+
+    pub fn remote_snapshot(&self, node_id: &str) -> Vec<RemotePlayerInfo> {
+        self.sessions
+            .iter()
+            .map(|entry| {
+                let session = entry.value();
+                RemotePlayerInfo {
+                    uuid: session.player.uuid,
+                    username: session.player.username.to_string(),
+                    node_id: node_id.to_string(),
+                    backend: session
+                        .current_backend()
+                        .map(|backend| backend.name().to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    connected_at: session.connected_at(),
+                }
+            })
+            .collect()
     }
 
     pub fn relay_sender(&self, uuid: Uuid) -> Option<mpsc::Sender<RelayCommand>> {

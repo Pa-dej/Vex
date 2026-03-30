@@ -21,9 +21,10 @@ use crate::config::PluginConfig;
 use crate::event::Event;
 use crate::player::ProxiedPlayer;
 use crate::scheduler::Scheduler;
-use crate::server::BackendRef;
+use crate::server::{AnyPlayerInfo, BackendRef, NodeInfo};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type BoxFutureValue<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type ErasedHandler = Arc<dyn Fn(Arc<dyn Any + Send + Sync>) -> BoxFuture + Send + Sync>;
 type CommandHandler = Arc<dyn Fn(CommandSender, Vec<String>) + Send + Sync>;
 type PermissionChecker = Arc<dyn Fn(&ProxiedPlayer, &str) -> bool + Send + Sync>;
@@ -461,6 +462,16 @@ pub trait ProxyOps: Send + Sync + 'static {
         data: Bytes,
         filter: &(dyn Fn(&ProxiedPlayer) -> bool + Send + Sync),
     );
+    /// Returns all players across cluster (falls back to local when not clustered).
+    fn get_all_players(&self) -> BoxFutureValue<Vec<AnyPlayerInfo>>;
+    /// Returns global player count across cluster (falls back to local).
+    fn global_online_count(&self) -> BoxFutureValue<usize>;
+    /// Broadcasts across cluster (falls back to local).
+    fn global_broadcast(&self, message: String) -> BoxFutureValue<()>;
+    /// Returns true when cluster backend is enabled and healthy enough for sync.
+    fn is_clustered(&self) -> bool;
+    /// Returns active cluster nodes.
+    fn get_nodes(&self) -> BoxFutureValue<Vec<NodeInfo>>;
 }
 
 /// Object-safe wrapper around [`ProxyOps`].
@@ -524,6 +535,31 @@ impl ProxyHandle {
         F: Fn(&ProxiedPlayer) -> bool + Send + Sync,
     {
         self.ops.forward_plugin_message(channel, data, &filter);
+    }
+
+    /// Returns local and remote players depending on cluster mode.
+    pub async fn get_all_players(&self) -> Vec<AnyPlayerInfo> {
+        self.ops.get_all_players().await
+    }
+
+    /// Returns global online count when clustered, otherwise local count.
+    pub async fn global_online_count(&self) -> usize {
+        self.ops.global_online_count().await
+    }
+
+    /// Broadcasts message to all nodes when clustered.
+    pub async fn global_broadcast(&self, message: &str) {
+        self.ops.global_broadcast(message.to_string()).await;
+    }
+
+    /// Returns cluster status.
+    pub fn is_clustered(&self) -> bool {
+        self.ops.is_clustered()
+    }
+
+    /// Returns list of active cluster nodes.
+    pub async fn get_nodes(&self) -> Vec<NodeInfo> {
+        self.ops.get_nodes().await
     }
 }
 

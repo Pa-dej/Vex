@@ -34,6 +34,13 @@ pub struct Metrics {
     connections_per_second: IntGauge,
     process_memory_bytes: IntGauge,
     tokio_tasks_active: IntGauge,
+    cluster_nodes_active: IntGauge,
+    cluster_global_players: IntGauge,
+    cluster_redis_ops_total: IntCounterVec,
+    cluster_redis_errors_total: IntCounterVec,
+    cluster_events_published: IntCounter,
+    cluster_events_received: IntCounter,
+    cluster_sync_duration_seconds: Histogram,
 }
 
 impl Metrics {
@@ -259,6 +266,59 @@ impl Metrics {
         ))?;
         registry.register(Box::new(tokio_tasks_active.clone()))?;
 
+        let cluster_nodes_active = IntGauge::with_opts(Opts::new(
+            "vex_cluster_nodes_active",
+            "Active cluster nodes seen in last heartbeat window",
+        ))?;
+        registry.register(Box::new(cluster_nodes_active.clone()))?;
+
+        let cluster_global_players = IntGauge::with_opts(Opts::new(
+            "vex_cluster_global_players",
+            "Total players across all cluster nodes",
+        ))?;
+        registry.register(Box::new(cluster_global_players.clone()))?;
+
+        let cluster_redis_ops_total = IntCounterVec::new(
+            Opts::new(
+                "vex_cluster_redis_ops_total",
+                "Cluster Redis operations partitioned by operation type",
+            ),
+            &["op"],
+        )?;
+        registry.register(Box::new(cluster_redis_ops_total.clone()))?;
+        let _ = cluster_redis_ops_total.with_label_values(&["noop"]);
+
+        let cluster_redis_errors_total = IntCounterVec::new(
+            Opts::new(
+                "vex_cluster_redis_errors_total",
+                "Cluster Redis errors partitioned by operation type",
+            ),
+            &["op"],
+        )?;
+        registry.register(Box::new(cluster_redis_errors_total.clone()))?;
+        let _ = cluster_redis_errors_total.with_label_values(&["noop"]);
+
+        let cluster_events_published = IntCounter::with_opts(Opts::new(
+            "vex_cluster_events_published",
+            "Cluster events published to Redis pub/sub",
+        ))?;
+        registry.register(Box::new(cluster_events_published.clone()))?;
+
+        let cluster_events_received = IntCounter::with_opts(Opts::new(
+            "vex_cluster_events_received",
+            "Cluster events received from Redis pub/sub",
+        ))?;
+        registry.register(Box::new(cluster_events_received.clone()))?;
+
+        let cluster_sync_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "vex_cluster_sync_duration_seconds",
+                "Duration of cluster full sync/heartbeat cycle",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0]),
+        )?;
+        registry.register(Box::new(cluster_sync_duration_seconds.clone()))?;
+
         Ok(Self {
             registry,
             active_connections,
@@ -285,6 +345,13 @@ impl Metrics {
             connections_per_second,
             process_memory_bytes,
             tokio_tasks_active,
+            cluster_nodes_active,
+            cluster_global_players,
+            cluster_redis_ops_total,
+            cluster_redis_errors_total,
+            cluster_events_published,
+            cluster_events_received,
+            cluster_sync_duration_seconds,
         })
     }
 
@@ -443,6 +510,36 @@ impl Metrics {
         self.tokio_tasks_active.set(tasks as i64);
     }
 
+    pub fn set_cluster_nodes_active(&self, nodes: i64) {
+        self.cluster_nodes_active.set(nodes);
+    }
+
+    pub fn set_cluster_global_players(&self, players: i64) {
+        self.cluster_global_players.set(players);
+    }
+
+    pub fn inc_cluster_redis_op(&self, op: &str) {
+        self.cluster_redis_ops_total.with_label_values(&[op]).inc();
+    }
+
+    pub fn inc_cluster_redis_error(&self, op: &str) {
+        self.cluster_redis_errors_total
+            .with_label_values(&[op])
+            .inc();
+    }
+
+    pub fn inc_cluster_events_published(&self) {
+        self.cluster_events_published.inc();
+    }
+
+    pub fn inc_cluster_events_received(&self) {
+        self.cluster_events_received.inc();
+    }
+
+    pub fn observe_cluster_sync_duration(&self, seconds: f64) {
+        self.cluster_sync_duration_seconds.observe(seconds);
+    }
+
     pub fn gather_text(&self) -> Result<String> {
         let mut output = Vec::new();
         let encoder = TextEncoder::new();
@@ -570,6 +667,13 @@ mod tests {
             "vex_connections_per_second",
             "vex_process_memory_bytes",
             "vex_tokio_tasks_active",
+            "vex_cluster_nodes_active",
+            "vex_cluster_global_players",
+            "vex_cluster_redis_ops_total",
+            "vex_cluster_redis_errors_total",
+            "vex_cluster_events_published",
+            "vex_cluster_events_received",
+            "vex_cluster_sync_duration_seconds",
         ];
         for metric_name in expected {
             assert!(

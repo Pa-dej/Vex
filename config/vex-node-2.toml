@@ -1,0 +1,37 @@
+[listener]
+bind = "0.0.0.0:25578"
+max_packet_size = 8388608
+
+[admin]
+bind = "127.0.0.1:18082"
+auth_token = "change-me"
+
+[cluster]
+enabled = true
+node_id = "node-2"
+node_announce_interval_ms = 5000
+
+[cluster.redis]
+url = "redis://127.0.0.1:6379"
+prefix = "vex:"
+connect_timeout_ms = 2000
+operation_timeout_ms = 500
+max_connections = 16
+
+[auth]
+mode = "offline"
+
+[routing]
+allow_degraded = true
+
+[[routing.backends]]
+name = "mock-backend"
+address = "127.0.0.1:25565"
+weight = 1.0
+
+[protocol_map]
+path = "config/protocol_ids.toml"
+
+[forwarding.velocity]
+enabled = true
+secret = "test-secret-123"

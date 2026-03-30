@@ -1,22 +1,23 @@
-version: "3.9"
-
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+
   prometheus:
     image: prom/prometheus:latest
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
 
   grafana:
     image: grafana/grafana:latest
-    depends_on:
-      - prometheus
     ports:
       - "3000:3000"
     volumes:
-      - ./grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
-      - ./grafana/provisioning/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
-      - ./grafana/vex-dashboard.json:/etc/grafana/provisioning/dashboards/vex-dashboard.json:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/vex-dashboard.json:/var/lib/grafana/dashboards/vex-dashboard.json
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin

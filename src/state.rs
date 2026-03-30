@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -8,11 +10,12 @@ use uuid::Uuid;
 use vex_proxy_sdk::api::{CommandRegistry, EventBus, ProxyHandle, ProxyOps};
 use vex_proxy_sdk::event::OnPermissionCheck;
 use vex_proxy_sdk::player::ProxiedPlayer;
-use vex_proxy_sdk::server::{BackendInfo, BackendRef};
+use vex_proxy_sdk::server::{AnyPlayerInfo, BackendInfo, BackendRef, NodeInfo};
 
 use crate::analytics::AttackAnalytics;
 use crate::auth_circuit::AuthCircuitBreaker;
 use crate::backend::BackendPool;
+use crate::cluster::ClusterHandle;
 use crate::config::{AuthMode, Config};
 use crate::crypto::RsaKeyPair;
 use crate::limiter::ConnectionLimiter;
@@ -55,6 +58,7 @@ pub struct RuntimeState {
     reputation: Arc<ReputationStore>,
     attack_analytics: Arc<AttackAnalytics>,
     plugin_runtime: Arc<PluginRuntime>,
+    cluster: Arc<ClusterHandle>,
 }
 
 #[derive(Clone)]
@@ -87,6 +91,7 @@ impl PluginRuntime {
 struct RuntimeProxyOps {
     snapshot: Arc<ArcSwap<RuntimeSnapshot>>,
     sessions: Arc<SessionRegistry>,
+    cluster: Arc<ClusterHandle>,
 }
 
 impl ProxyOps for RuntimeProxyOps {
@@ -142,10 +147,61 @@ impl ProxyOps for RuntimeProxyOps {
     ) {
         self.sessions.forward_plugin_message(channel, data, filter);
     }
+
+    fn get_all_players(&self) -> Pin<Box<dyn Future<Output = Vec<AnyPlayerInfo>> + Send>> {
+        let sessions = self.sessions.clone();
+        let cluster = self.cluster.clone();
+        Box::pin(async move {
+            let mut players = sessions
+                .get_players()
+                .into_iter()
+                .map(AnyPlayerInfo::Local)
+                .collect::<Vec<_>>();
+            for remote in cluster.get_global_players().await {
+                if remote.node_id != cluster.node_id() {
+                    players.push(AnyPlayerInfo::Remote(remote));
+                }
+            }
+            players
+        })
+    }
+
+    fn global_online_count(&self) -> Pin<Box<dyn Future<Output = usize> + Send>> {
+        let sessions = self.sessions.clone();
+        let cluster = self.cluster.clone();
+        Box::pin(async move {
+            if cluster.is_clustered() {
+                cluster.get_global_online_count().await
+            } else {
+                sessions.online_count()
+            }
+        })
+    }
+
+    fn global_broadcast(&self, message: String) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let sessions = self.sessions.clone();
+        let cluster = self.cluster.clone();
+        Box::pin(async move {
+            if cluster.is_clustered() {
+                cluster.broadcast_cluster(&message).await;
+            } else {
+                sessions.broadcast(&message);
+            }
+        })
+    }
+
+    fn is_clustered(&self) -> bool {
+        self.cluster.is_clustered()
+    }
+
+    fn get_nodes(&self) -> Pin<Box<dyn Future<Output = Vec<NodeInfo>> + Send>> {
+        let cluster = self.cluster.clone();
+        Box::pin(async move { cluster.get_node_list().await })
+    }
 }
 
 impl RuntimeState {
-    pub fn new(
+    pub async fn new(
         config: Config,
         protocol_map: ProtocolMap,
         metrics: Arc<Metrics>,
@@ -196,9 +252,61 @@ impl RuntimeState {
             let _ = join.join();
             event.is_allowed()
         });
+        let cluster_started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let cluster_node_id = Arc::<str>::from(config.cluster.node_id.clone());
+        let cluster = Arc::new(
+            ClusterHandle::new(
+                &config.cluster,
+                Arc::new({
+                    let sessions = sessions.clone();
+                    let node_id = cluster_node_id.clone();
+                    move || sessions.remote_snapshot(node_id.as_ref())
+                }),
+                Arc::new({
+                    let sessions = sessions.clone();
+                    move || sessions.online_count()
+                }),
+                Arc::new({
+                    let sessions = sessions.clone();
+                    move |message| sessions.broadcast(message)
+                }),
+                Arc::new({
+                    let node_id = cluster_node_id.clone();
+                    let bind_addr = config.listener.bind.clone();
+                    let metrics_version = env!("CARGO_PKG_VERSION").to_string();
+                    let sessions = sessions.clone();
+                    move || NodeInfo {
+                        node_id: node_id.to_string(),
+                        bind_addr: bind_addr.clone(),
+                        online_players: sessions.online_count() as u32,
+                        started_at: cluster_started_at,
+                        version: metrics_version.clone(),
+                    }
+                }),
+                metrics.clone(),
+            )
+            .await?,
+        );
+        {
+            let cluster_for_reputation = cluster.clone();
+            reputation.set_cluster_notifier(Arc::new(move |ip, delta| {
+                if !cluster_for_reputation.is_clustered() {
+                    return;
+                }
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let cluster = cluster_for_reputation.clone();
+                    handle.spawn(async move {
+                        cluster.publish_reputation_delta(ip, delta).await;
+                    });
+                }
+            }));
+        }
         let proxy = Arc::new(ProxyHandle::new(Arc::new(RuntimeProxyOps {
             snapshot: snapshot.clone(),
             sessions: sessions.clone(),
+            cluster: cluster.clone(),
         })));
         let plugin_runtime = Arc::new(PluginRuntime {
             events,
@@ -227,6 +335,7 @@ impl RuntimeState {
             reputation,
             attack_analytics,
             plugin_runtime,
+            cluster,
         })
     }
 
@@ -280,6 +389,10 @@ impl RuntimeState {
 
     pub fn plugin_runtime(&self) -> Arc<PluginRuntime> {
         self.plugin_runtime.clone()
+    }
+
+    pub fn cluster(&self) -> Arc<ClusterHandle> {
+        self.cluster.clone()
     }
 
     pub async fn apply_reload(

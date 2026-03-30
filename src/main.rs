@@ -2,6 +2,7 @@ mod admin;
 mod analytics;
 mod auth_circuit;
 mod backend;
+mod cluster;
 mod config;
 mod crypto;
 mod event_bus;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use tracing::{error, info};
 
 use crate::admin::{AdminContext, run_admin_server};
@@ -38,9 +40,21 @@ use crate::server::run_proxy_server;
 use crate::state::RuntimeState;
 use crate::telemetry::init_tracing;
 
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Vex Minecraft proxy", long_about = None)]
+struct Cli {
+    /// Path to config TOML file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = PathBuf::from("vex.toml");
+    let cli = Cli::parse();
+    let config_path = cli
+        .config
+        .or_else(|| std::env::var("VEX_CONFIG_PATH").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("vex.toml"));
     let config = Config::load_or_default(&config_path)?;
     init_tracing(
         &config.observability.log_level,
@@ -62,7 +76,36 @@ async fn main() -> Result<()> {
     }
     let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
 
-    let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends)?;
+    let state = RuntimeState::new(config.clone(), protocol_map, metrics, backends).await?;
+    state
+        .cluster()
+        .start_background_tasks(state.shutdown.clone());
+    let cluster = state.cluster();
+    let limiter = state.limiter();
+    let reputation = state.reputation();
+    let local_node = cluster.node_id().to_string();
+    cluster
+        .subscribe(Arc::new(move |event| match event {
+            crate::cluster::pubsub::ClusterEvent::AttackModeOn { node_id, .. }
+                if node_id != local_node =>
+            {
+                limiter.set_attack_mode(true);
+            }
+            crate::cluster::pubsub::ClusterEvent::AttackModeOff { node_id }
+                if node_id != local_node =>
+            {
+                limiter.set_attack_mode(false);
+            }
+            crate::cluster::pubsub::ClusterEvent::ReputationDelta {
+                ip,
+                delta,
+                source_node,
+            } if source_node != local_node => {
+                reputation.apply_cluster_delta(ip, delta);
+            }
+            _ => {}
+        }))
+        .await;
     let _reputation_maintenance_task = state.reputation().spawn_maintenance_task();
 
     let plugin_runtime = state.plugin_runtime();

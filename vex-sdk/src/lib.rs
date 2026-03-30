@@ -66,7 +66,7 @@ pub use meta::{PlayerMeta, PlayerMetaOps};
 pub use player::{PlayerHooks, PlayerRef, ProxiedPlayer, TransferResult};
 pub use plugin_meta::PluginMeta;
 pub use scheduler::{BoxFuture, Scheduler, TaskHandle};
-pub use server::{BackendInfo, BackendRef, HealthState};
+pub use server::{AnyPlayerInfo, BackendInfo, BackendRef, HealthState, NodeInfo, RemotePlayerInfo};
 
 /// ABI version used by the Vex proxy/plugin loader compatibility check.
 #[no_mangle]

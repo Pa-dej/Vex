@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -12,6 +13,8 @@ const MAX_SCORE: i32 = 100;
 const VIOLATION_WINDOW: Duration = Duration::from_secs(60);
 const PENALTY_ESCALATION_WINDOW: Duration = Duration::from_secs(60 * 60);
 const CONNECTION_BLOCK_MESSAGE: &str = "Connection refused due to suspicious activity";
+
+type ClusterNotifier = Arc<dyn Fn(IpAddr, i32) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct ReputationEntry {
@@ -53,10 +56,11 @@ pub enum ReputationAction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReputationStore {
     entries: DashMap<IpAddr, ReputationEntry>,
     config: ReputationConfig,
+    cluster_notifier: Arc<RwLock<Option<ClusterNotifier>>>,
 }
 
 impl ReputationStore {
@@ -64,6 +68,7 @@ impl ReputationStore {
         Self {
             entries: DashMap::new(),
             config,
+            cluster_notifier: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -98,6 +103,26 @@ impl ReputationStore {
 
     pub fn record_rate_limit_hit(&self, ip: IpAddr) {
         self.record_rate_limit_hit_at(ip, Instant::now());
+    }
+
+    pub fn set_cluster_notifier(&self, notifier: ClusterNotifier) {
+        if let Ok(mut guard) = self.cluster_notifier.write() {
+            *guard = Some(notifier);
+        }
+    }
+
+    pub fn apply_cluster_delta(&self, ip: IpAddr, delta: i32) {
+        if !self.config.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let mut entry = self
+            .entries
+            .entry(ip)
+            .or_insert_with(|| ReputationEntry::new(now));
+        entry.last_seen = now;
+        let proposed = clamp_score(entry.score + delta);
+        entry.score = crate::cluster::shared_state::take_worst_score(entry.score, proposed);
     }
 
     fn assess_connection_at(&self, ip: IpAddr, now: Instant) -> ReputationAction {
@@ -162,6 +187,7 @@ impl ReputationStore {
         entry.last_seen = now;
         entry.consecutive_violations = 0;
         entry.score = clamp_score(entry.score + 5);
+        self.publish_delta(ip, 5);
     }
 
     fn record_login_disconnect_at(&self, ip: IpAddr, now: Instant) {
@@ -225,6 +251,7 @@ impl ReputationStore {
             entry.score = 0;
             let _ = apply_penalty_block(now, PenaltyTier::Max, &self.config, &mut entry);
         }
+        self.publish_delta(ip, -penalty);
     }
 
     fn run_decay_and_cleanup(&self) {
@@ -256,6 +283,14 @@ impl ReputationStore {
 
             true
         });
+    }
+
+    fn publish_delta(&self, ip: IpAddr, delta: i32) {
+        if let Ok(guard) = self.cluster_notifier.read()
+            && let Some(notifier) = guard.as_ref()
+        {
+            notifier(ip, delta);
+        }
     }
 
     #[cfg(test)]

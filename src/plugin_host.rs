@@ -470,7 +470,9 @@ fn is_dynamic_library(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
@@ -480,7 +482,7 @@ mod tests {
     use vex_proxy_sdk::Scheduler;
     use vex_proxy_sdk::api::{CommandRegistry, ProxyHandle, ProxyOps};
     use vex_proxy_sdk::player::ProxiedPlayer;
-    use vex_proxy_sdk::server::BackendRef;
+    use vex_proxy_sdk::server::{AnyPlayerInfo, BackendRef, NodeInfo};
 
     use super::{PluginHost, build_reload_plan, cancel_scheduler_for_unload};
 
@@ -525,6 +527,26 @@ mod tests {
             _data: bytes::Bytes,
             _filter: &(dyn Fn(&ProxiedPlayer) -> bool + Send + Sync),
         ) {
+        }
+
+        fn get_all_players(&self) -> Pin<Box<dyn Future<Output = Vec<AnyPlayerInfo>> + Send>> {
+            Box::pin(async { Vec::new() })
+        }
+
+        fn global_online_count(&self) -> Pin<Box<dyn Future<Output = usize> + Send>> {
+            Box::pin(async { 0 })
+        }
+
+        fn global_broadcast(&self, _message: String) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+
+        fn is_clustered(&self) -> bool {
+            false
+        }
+
+        fn get_nodes(&self) -> Pin<Box<dyn Future<Output = Vec<NodeInfo>> + Send>> {
+            Box::pin(async { Vec::new() })
         }
     }
 

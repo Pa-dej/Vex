@@ -1,6 +1,6 @@
 [package]
 name = "vex-proxy-sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Plugin SDK for the Vex Minecraft proxy"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,7 @@ bytes = "1"
 dashmap = "6.1"
 thiserror = "2.0"
 tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 toml = "0.8"

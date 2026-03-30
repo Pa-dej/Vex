@@ -44,6 +44,9 @@ use crate::state::RuntimeState;
 use crate::telemetry::generate_trace_id;
 
 pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
+    state
+        .cluster()
+        .start_background_tasks(state.shutdown.clone());
     let snapshot = state.snapshot();
     let bind_addr = snapshot.config.listener.bind.clone();
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -127,6 +130,29 @@ pub async fn run_proxy_server(state: RuntimeState) -> Result<()> {
                         continue;
                     }
                 };
+
+                if state.cluster().is_clustered() {
+                    let global_allowed = state
+                        .cluster()
+                        .check_global_rate_limit(addr.ip(), state.snapshot().config.limits.per_ip_rate_limit)
+                        .await;
+                    if !global_allowed {
+                        state.reputation().record_rate_limit_hit(addr.ip());
+                        state.metrics.inc_reject("cluster_ip_rate_limit");
+                        state.metrics.inc_ratelimit_hit("cluster");
+                        state.metrics.inc_connection_result("reject");
+                        state
+                            .metrics
+                            .observe_connection_duration(accepted_at.elapsed().as_secs_f64());
+                        let mut stream = stream;
+                        let _ = reject_without_handshake(
+                            &mut stream,
+                            "Too many global connections from your address",
+                        )
+                        .await;
+                        continue;
+                    }
+                }
 
                 let reputation_delay = match state.reputation().assess_connection(addr.ip()) {
                     ReputationAction::Allow => None,
@@ -226,6 +252,8 @@ fn apply_attack_update(state: &RuntimeState, update: AttackUpdate) {
         let events = state.plugin_runtime().events.clone();
         let cps = update.connections_per_second as f64;
         let fail_ratio = update.login_fail_ratio;
+        let cluster = state.cluster();
+        let node_id = cluster.node_id().to_string();
         tokio::spawn(async move {
             let _ = events
                 .dispatch(Arc::new(OnAttackModeChange {
@@ -234,6 +262,18 @@ fn apply_attack_update(state: &RuntimeState, update: AttackUpdate) {
                     fail_ratio,
                 }))
                 .await;
+            if enabled {
+                cluster
+                    .publish_event(crate::cluster::pubsub::ClusterEvent::AttackModeOn {
+                        node_id,
+                        cps,
+                    })
+                    .await;
+            } else {
+                cluster
+                    .publish_event(crate::cluster::pubsub::ClusterEvent::AttackModeOff { node_id })
+                    .await;
+            }
         });
         if enabled {
             state.metrics.inc_attack_detection();
@@ -2710,7 +2750,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let pool = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config.clone(), protocol_map, metrics, pool)?;
+        let state = RuntimeState::new(config.clone(), protocol_map, metrics, pool).await?;
 
         let server_state = state.clone();
         let server_task = tokio::spawn(async move { run_proxy_server(server_state).await });
@@ -2843,7 +2883,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state
             .reputation()
             .set_score_for_test(IpAddr::V4(Ipv4Addr::LOCALHOST), 5);
@@ -2890,7 +2930,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state
             .reputation()
             .set_score_for_test(IpAddr::V4(Ipv4Addr::LOCALHOST), 30);
@@ -2948,7 +2988,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state
             .reputation()
             .set_score_for_test(IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
@@ -2996,7 +3036,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
 
         let (tx, rx) = oneshot::channel::<(bool, f64, f64)>();
         let sender = StdArc::new(tokio::sync::Mutex::new(Some(tx)));
@@ -3055,7 +3095,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state.plugin_runtime().set_active_plugins(1);
         state
             .plugin_runtime()
@@ -3101,7 +3141,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state.plugin_runtime().set_active_plugins(1);
         state
             .plugin_runtime()
@@ -3167,7 +3207,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state.plugin_runtime().set_active_plugins(1);
 
         let kick_calls = StdArc::new(AtomicUsize::new(0));
@@ -3315,7 +3355,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state.plugin_runtime().set_active_plugins(1);
 
         let switched_count = StdArc::new(AtomicUsize::new(0));
@@ -3443,7 +3483,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state.plugin_runtime().set_active_plugins(1);
 
         let (backend1_send_tx, backend1_send_rx) = oneshot::channel::<()>();
@@ -3545,7 +3585,7 @@ mod tests {
         let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
         let metrics = Arc::new(Metrics::new()?);
         let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
-        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends).await?;
         state.plugin_runtime().set_active_plugins(1);
 
         let observed_channels = StdArc::new(tokio::sync::Mutex::new(Vec::<String>::new()));

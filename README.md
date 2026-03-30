@@ -2,6 +2,11 @@
 
 High-performance Rust Minecraft Java proxy with hot reload, anti-bot, observability, and a dynamic plugin API.
 
+## Documentation (Wiki)
+
+- English: `docs/wiki/Home-en.md`
+- Русский: `docs/wiki/Home-ru.md`
+
 ## 1) Benchmark: Vex vs Gate vs BungeeCord
 
 Internal benchmark scenario: 10,000 concurrent connections, same host class, measured resident memory per connection.
