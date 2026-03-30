@@ -1,0 +1,6 @@
+name = "hello_plugin"
+version = "3.1.0"
+author = "Vex Team"
+description = "Example plugin for Scheduler API and Config API."
+vex_sdk_version = 1
+depends = []

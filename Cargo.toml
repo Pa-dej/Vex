@@ -46,7 +46,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sysinfo = "0.32"
 uuid = { version = "1", features = ["v3"] }
-vex-proxy-sdk = { version = "0.1.1", path = "vex-sdk", features = ["metrics"] }
+vex-proxy-sdk = { version = "0.2.0", path = "vex-sdk", features = ["metrics"] }
 
 [dev-dependencies]
 tempfile = "3"

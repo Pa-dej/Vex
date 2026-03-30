@@ -10,6 +10,11 @@ use vex_proxy_sdk::meta::PlayerMeta;
 use vex_proxy_sdk::player::{PlayerHooks, ProxiedPlayer};
 use vex_proxy_sdk::server::BackendRef;
 
+use crate::mc::{
+    build_play_actionbar_packet, build_play_chat_message_packet, build_play_tab_list_packet,
+    build_play_title_subtitle_packet, build_play_title_text_packet, build_play_title_times_packet,
+};
+
 #[derive(Debug)]
 pub enum RelayCommand {
     Pause {
@@ -26,6 +31,7 @@ pub enum RelayCommand {
         channel: Arc<str>,
         data: Bytes,
     },
+    SendPacket(Vec<u8>),
 }
 
 #[derive(Clone)]
@@ -157,6 +163,82 @@ impl SessionRegistry {
             .is_ok()
     }
 
+    pub fn send_packet(&self, uuid: Uuid, packet: Vec<u8>) -> bool {
+        let Some(sender) = self.relay_sender(uuid) else {
+            return false;
+        };
+        sender.try_send(RelayCommand::SendPacket(packet)).is_ok()
+    }
+
+    pub fn set_tab_list(&self, uuid: Uuid, header: &str, footer: &str) -> bool {
+        let Some(session) = self.get(&uuid) else {
+            return false;
+        };
+        let Some(packet) =
+            build_play_tab_list_packet(session.player.protocol_version, header, footer)
+        else {
+            return false;
+        };
+        self.send_packet(uuid, packet)
+    }
+
+    pub fn send_title(
+        &self,
+        uuid: Uuid,
+        title: &str,
+        subtitle: &str,
+        fade_in_ticks: u32,
+        stay_ticks: u32,
+        fade_out_ticks: u32,
+    ) -> bool {
+        let Some(session) = self.get(&uuid) else {
+            return false;
+        };
+        let protocol = session.player.protocol_version;
+        let mut sent_any = false;
+        if let Some(times_packet) =
+            build_play_title_times_packet(protocol, fade_in_ticks, stay_ticks, fade_out_ticks)
+            && self.send_packet(uuid, times_packet)
+        {
+            sent_any = true;
+        }
+        if !title.is_empty()
+            && let Some(title_packet) = build_play_title_text_packet(protocol, title)
+            && self.send_packet(uuid, title_packet)
+        {
+            sent_any = true;
+        }
+        if !subtitle.is_empty()
+            && let Some(subtitle_packet) = build_play_title_subtitle_packet(protocol, subtitle)
+            && self.send_packet(uuid, subtitle_packet)
+        {
+            sent_any = true;
+        }
+        sent_any
+    }
+
+    pub fn send_actionbar(&self, uuid: Uuid, message: &str) -> bool {
+        let Some(session) = self.get(&uuid) else {
+            return false;
+        };
+        let Some(packet) = build_play_actionbar_packet(session.player.protocol_version, message)
+        else {
+            return false;
+        };
+        self.send_packet(uuid, packet)
+    }
+
+    pub fn send_message(&self, uuid: Uuid, message: &str) -> bool {
+        let Some(session) = self.get(&uuid) else {
+            return false;
+        };
+        let Some(packet) = build_play_chat_message_packet(session.player.protocol_version, message)
+        else {
+            return false;
+        };
+        self.send_packet(uuid, packet)
+    }
+
     pub fn broadcast(&self, message: &str) {
         let payload = Bytes::from(message.to_string());
         for player in self.get_players() {
@@ -189,6 +271,10 @@ impl SessionRegistry {
         let transfer_registry = Arc::clone(self);
         let current_backend_registry = Arc::clone(self);
         let latency_registry = Arc::clone(self);
+        let tab_list_registry = Arc::clone(self);
+        let title_registry = Arc::clone(self);
+        let actionbar_registry = Arc::clone(self);
+        let message_registry = Arc::clone(self);
 
         PlayerHooks {
             disconnect: Arc::new(move |uuid, reason| {
@@ -210,6 +296,27 @@ impl SessionRegistry {
                     .get(&uuid)
                     .map(|session| session.latency_ms())
                     .unwrap_or(0)
+            }),
+            set_tab_list: Arc::new(move |uuid, header, footer| {
+                let _ = tab_list_registry.set_tab_list(uuid, header, footer);
+            }),
+            send_title: Arc::new(
+                move |uuid, title, subtitle, fade_in_ticks, stay_ticks, fade_out_ticks| {
+                    let _ = title_registry.send_title(
+                        uuid,
+                        title,
+                        subtitle,
+                        fade_in_ticks,
+                        stay_ticks,
+                        fade_out_ticks,
+                    );
+                },
+            ),
+            send_actionbar: Arc::new(move |uuid, message| {
+                let _ = actionbar_registry.send_actionbar(uuid, message);
+            }),
+            send_message: Arc::new(move |uuid, message| {
+                let _ = message_registry.send_message(uuid, message);
             }),
         }
     }

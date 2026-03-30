@@ -1635,6 +1635,10 @@ async fn relay_with_control_plain_client(
                                 write_packet(client, &encoded).await?;
                             }
                         }
+                        RelayCommand::SendPacket(packet) => {
+                            let encoded = encode_generated_play_packet_for_player(player, &packet)?;
+                            write_packet(client, &encoded).await?;
+                        }
                     }
                 }
                 changed = shutdown_rx.changed() => {
@@ -1773,6 +1777,10 @@ async fn relay_with_control_plain_client(
                                 write_packet(client, &encoded).await?;
                             }
                         }
+                        RelayCommand::SendPacket(packet) => {
+                            let encoded = encode_generated_play_packet_for_player(player, &packet)?;
+                            write_packet(client, &encoded).await?;
+                        }
                     }
                 }
                 changed = shutdown_rx.changed() => {
@@ -1882,6 +1890,10 @@ async fn relay_with_control_encrypted_client(
                                 write_client_packet(client, &encoded, Some(&mut client_crypto))
                                     .await?;
                             }
+                        }
+                        RelayCommand::SendPacket(packet) => {
+                            let encoded = encode_generated_play_packet_for_player(player, &packet)?;
+                            write_client_packet(client, &encoded, Some(&mut client_crypto)).await?;
                         }
                     }
                 }
@@ -2022,6 +2034,10 @@ async fn relay_with_control_encrypted_client(
                                 write_client_packet(client, &encoded, Some(&mut client_crypto))
                                     .await?;
                             }
+                        }
+                        RelayCommand::SendPacket(packet) => {
+                            let encoded = encode_generated_play_packet_for_player(player, &packet)?;
+                            write_client_packet(client, &encoded, Some(&mut client_crypto)).await?;
                         }
                     }
                 }
@@ -2256,6 +2272,11 @@ async fn handle_relay_command_during_kick_plain(
                 let _ = write_packet(client, &encoded).await;
             }
         }
+        RelayCommand::SendPacket(packet) => {
+            if let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet) {
+                let _ = write_packet(client, &encoded).await;
+            }
+        }
     }
 }
 
@@ -2302,6 +2323,11 @@ async fn handle_relay_command_during_kick_encrypted(
                 build_internal_clientbound_message_packet(player, channel.as_ref(), &data)
                 && let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet)
             {
+                let _ = write_client_packet(client, &encoded, Some(client_crypto)).await;
+            }
+        }
+        RelayCommand::SendPacket(packet) => {
+            if let Ok(encoded) = encode_generated_play_packet_for_player(player, &packet) {
                 let _ = write_client_packet(client, &encoded, Some(client_crypto)).await;
             }
         }

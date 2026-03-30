@@ -517,6 +517,78 @@ pub fn build_play_system_chat_packet(
     Some(payload.to_vec())
 }
 
+pub fn build_play_chat_message_packet(protocol: u32, message: &str) -> Option<Vec<u8>> {
+    build_play_system_chat_packet(protocol, message, false)
+}
+
+pub fn build_play_actionbar_packet(protocol: u32, message: &str) -> Option<Vec<u8>> {
+    let packet_id = match protocol {
+        774 => 0x4C,
+        _ => return None,
+    };
+
+    let mut payload = BytesMut::with_capacity(message.len() + 24);
+    write_varint(packet_id, &mut payload);
+    write_anonymous_nbt_text_component(message, &mut payload);
+    Some(payload.to_vec())
+}
+
+pub fn build_play_tab_list_packet(protocol: u32, header: &str, footer: &str) -> Option<Vec<u8>> {
+    let packet_id = match protocol {
+        774 => 0x65,
+        _ => return None,
+    };
+
+    let mut payload = BytesMut::with_capacity(header.len() + footer.len() + 32);
+    write_varint(packet_id, &mut payload);
+    write_anonymous_nbt_text_component(header, &mut payload);
+    write_anonymous_nbt_text_component(footer, &mut payload);
+    Some(payload.to_vec())
+}
+
+pub fn build_play_title_text_packet(protocol: u32, title: &str) -> Option<Vec<u8>> {
+    let packet_id = match protocol {
+        774 => 0x60,
+        _ => return None,
+    };
+
+    let mut payload = BytesMut::with_capacity(title.len() + 24);
+    write_varint(packet_id, &mut payload);
+    write_anonymous_nbt_text_component(title, &mut payload);
+    Some(payload.to_vec())
+}
+
+pub fn build_play_title_subtitle_packet(protocol: u32, subtitle: &str) -> Option<Vec<u8>> {
+    let packet_id = match protocol {
+        774 => 0x61,
+        _ => return None,
+    };
+
+    let mut payload = BytesMut::with_capacity(subtitle.len() + 24);
+    write_varint(packet_id, &mut payload);
+    write_anonymous_nbt_text_component(subtitle, &mut payload);
+    Some(payload.to_vec())
+}
+
+pub fn build_play_title_times_packet(
+    protocol: u32,
+    fade_in_ticks: u32,
+    stay_ticks: u32,
+    fade_out_ticks: u32,
+) -> Option<Vec<u8>> {
+    let packet_id = match protocol {
+        774 => 0x62,
+        _ => return None,
+    };
+
+    let mut payload = BytesMut::with_capacity(1 + 12);
+    write_varint(packet_id, &mut payload);
+    payload.put_i32(i32::try_from(fade_in_ticks).unwrap_or(i32::MAX));
+    payload.put_i32(i32::try_from(stay_ticks).unwrap_or(i32::MAX));
+    payload.put_i32(i32::try_from(fade_out_ticks).unwrap_or(i32::MAX));
+    Some(payload.to_vec())
+}
+
 pub fn parse_play_plugin_message_packet(
     payload: &[u8],
     protocol: u32,

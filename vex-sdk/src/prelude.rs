@@ -10,9 +10,12 @@ pub use crate::api::{
     CommandRegistry, CommandSender, EventBus, MetricsHandle, PluginApi, PluginCounter, PluginGauge,
     PluginHistogram, ProxyHandle,
 };
+pub use crate::config::{ConfigError, PluginConfig};
 pub use crate::event::*;
 pub use crate::message::PluginMessage;
 pub use crate::meta::{PlayerMeta, PlayerMetaOps};
 pub use crate::player::{ProxiedPlayer, TransferResult};
+pub use crate::plugin_meta::PluginMeta;
+pub use crate::scheduler::{BoxFuture, Scheduler, TaskHandle};
 pub use crate::server::{BackendInfo, BackendRef, HealthState};
 pub use crate::VexPlugin;

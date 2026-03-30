@@ -234,6 +234,7 @@ mod tests {
                             }
                             RelayCommand::Disconnect(_) => break,
                             RelayCommand::PluginMessage { .. } => {}
+                            RelayCommand::SendPacket(_) => {}
                         }
                     }
                     _ = backend1_conn.read_u8(), if !paused => {
@@ -324,7 +325,9 @@ mod tests {
                     RelayCommand::SwitchBackend { ack, .. } => {
                         let _ = ack.send(Ok(()));
                     }
-                    RelayCommand::Disconnect(_) | RelayCommand::PluginMessage { .. } => {}
+                    RelayCommand::Disconnect(_)
+                    | RelayCommand::PluginMessage { .. }
+                    | RelayCommand::SendPacket(_) => {}
                 }
             }
         });

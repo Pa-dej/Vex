@@ -42,11 +42,14 @@
 //! ```
 
 pub mod api;
+pub mod config;
 pub mod event;
 pub mod message;
 pub mod meta;
 pub mod player;
+pub mod plugin_meta;
 pub mod prelude;
+pub mod scheduler;
 pub mod server;
 
 use std::error::Error;
@@ -56,10 +59,13 @@ pub use api::{
     CommandRegistry, CommandSender, EventBus, MetricsError, MetricsHandle, PluginApi,
     PluginCounter, PluginGauge, PluginHistogram, PluginLogger, ProxyHandle, ProxyOps,
 };
+pub use config::{ConfigError, PluginConfig};
 pub use event::*;
 pub use message::PluginMessage;
 pub use meta::{PlayerMeta, PlayerMetaOps};
 pub use player::{PlayerHooks, PlayerRef, ProxiedPlayer, TransferResult};
+pub use plugin_meta::PluginMeta;
+pub use scheduler::{BoxFuture, Scheduler, TaskHandle};
 pub use server::{BackendInfo, BackendRef, HealthState};
 
 /// ABI version used by the Vex proxy/plugin loader compatibility check.

@@ -17,8 +17,10 @@ use tokio::time::timeout;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use crate::config::PluginConfig;
 use crate::event::Event;
 use crate::player::ProxiedPlayer;
+use crate::scheduler::Scheduler;
 use crate::server::BackendRef;
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -35,6 +37,10 @@ pub struct PluginApi {
     pub proxy: Arc<ProxyHandle>,
     /// Command registry for plugin commands.
     pub commands: Arc<CommandRegistry>,
+    /// Plugin scheduler.
+    pub scheduler: Arc<Scheduler>,
+    /// Plugin configuration.
+    pub config: Arc<PluginConfig>,
     /// Plugin-scoped logger.
     pub logger: PluginLogger,
     /// Plugin metrics handle.
@@ -47,6 +53,8 @@ impl PluginApi {
         events: Arc<EventBus>,
         proxy: Arc<ProxyHandle>,
         commands: Arc<CommandRegistry>,
+        scheduler: Arc<Scheduler>,
+        config: Arc<PluginConfig>,
         logger: PluginLogger,
         metrics: Arc<MetricsHandle>,
     ) -> Self {
@@ -54,6 +62,8 @@ impl PluginApi {
             events,
             proxy,
             commands,
+            scheduler,
+            config,
             logger,
             metrics,
         }
@@ -108,8 +118,8 @@ impl EventBus {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use std::time::Duration;
-    /// # use vex_sdk::api::EventBus;
-    /// # use vex_sdk::event::OnLoginSuccess;
+    /// # use vex_proxy_sdk::api::EventBus;
+    /// # use vex_proxy_sdk::event::OnLoginSuccess;
     /// let bus = EventBus::new(Duration::from_millis(500));
     /// bus.on::<OnLoginSuccess, _, _>(|event| async move {
     ///     let _name = event.player.username.clone();
@@ -418,6 +428,7 @@ impl Default for CommandRegistry {
 
 /// Command invocation sender.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CommandSender {
     /// Proxy console/admin API context.
     Console,

@@ -34,6 +34,14 @@ pub type TransferHook = Arc<dyn Fn(Uuid, BackendRef) -> TransferResult + Send + 
 pub type CurrentBackendHook = Arc<dyn Fn(Uuid) -> Option<BackendRef> + Send + Sync>;
 /// Hook used by [`ProxiedPlayer::latency_ms`].
 pub type LatencyHook = Arc<dyn Fn(Uuid) -> u32 + Send + Sync>;
+/// Hook used by [`ProxiedPlayer::set_tab_list`].
+pub type TabListHook = Arc<dyn Fn(Uuid, &str, &str) + Send + Sync>;
+/// Hook used by [`ProxiedPlayer::send_title`].
+pub type TitleHook = Arc<dyn Fn(Uuid, &str, &str, u32, u32, u32) + Send + Sync>;
+/// Hook used by [`ProxiedPlayer::send_actionbar`].
+pub type ActionBarHook = Arc<dyn Fn(Uuid, &str) + Send + Sync>;
+/// Hook used by [`ProxiedPlayer::send_message`].
+pub type MessageHook = Arc<dyn Fn(Uuid, &str) + Send + Sync>;
 
 /// Proxy-provided hook table for player actions.
 #[derive(Clone)]
@@ -48,6 +56,14 @@ pub struct PlayerHooks {
     pub current_backend: CurrentBackendHook,
     /// Latency lookup implementation.
     pub latency_ms: LatencyHook,
+    /// Tab list update implementation.
+    pub set_tab_list: TabListHook,
+    /// Title update implementation.
+    pub send_title: TitleHook,
+    /// Action bar implementation.
+    pub send_actionbar: ActionBarHook,
+    /// Plain message implementation.
+    pub send_message: MessageHook,
 }
 
 impl Default for PlayerHooks {
@@ -58,6 +74,10 @@ impl Default for PlayerHooks {
             transfer: Arc::new(|_, _| TransferResult::PlayerDisconnected),
             current_backend: Arc::new(|_| None),
             latency_ms: Arc::new(|_| 0),
+            set_tab_list: Arc::new(|_, _, _| {}),
+            send_title: Arc::new(|_, _, _, _, _, _| {}),
+            send_actionbar: Arc::new(|_, _| {}),
+            send_message: Arc::new(|_, _| {}),
         }
     }
 }
@@ -127,7 +147,7 @@ impl ProxiedPlayer {
     ///
     /// ```no_run
     /// # use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    /// # use vex_sdk::{BackendInfo, BackendRef, PlayerHooks, PlayerMeta, ProxiedPlayer, TransferResult};
+    /// # use vex_proxy_sdk::{BackendInfo, BackendRef, PlayerHooks, PlayerMeta, ProxiedPlayer, TransferResult};
     /// # use uuid::Uuid;
     /// let player = ProxiedPlayer::new(
     ///     Uuid::new_v4(),
@@ -180,5 +200,39 @@ impl ProxiedPlayer {
     /// Returns current player latency in milliseconds.
     pub fn latency_ms(&self) -> u32 {
         (self.hooks.latency_ms)(self.uuid)
+    }
+
+    /// Sets tab list header/footer visible in the in-game player list.
+    pub fn set_tab_list(&self, header: &str, footer: &str) {
+        (self.hooks.set_tab_list)(self.uuid, header, footer);
+    }
+
+    /// Sends title/subtitle with animation timings.
+    pub fn send_title(
+        &self,
+        title: &str,
+        subtitle: &str,
+        fade_in_ticks: u32,
+        stay_ticks: u32,
+        fade_out_ticks: u32,
+    ) {
+        (self.hooks.send_title)(
+            self.uuid,
+            title,
+            subtitle,
+            fade_in_ticks,
+            stay_ticks,
+            fade_out_ticks,
+        );
+    }
+
+    /// Sends an action bar message above the hotbar.
+    pub fn send_actionbar(&self, message: &str) {
+        (self.hooks.send_actionbar)(self.uuid, message);
+    }
+
+    /// Sends a plain chat message.
+    pub fn send_message(&self, message: &str) {
+        (self.hooks.send_message)(self.uuid, message);
     }
 }

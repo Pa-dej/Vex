@@ -2,20 +2,14 @@
 
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use vex_proxy_sdk::VexPlugin;
 use vex_proxy_sdk::api::{CommandSender, PluginApi};
-use vex_proxy_sdk::event::{
-    OnAttackModeChange, OnBackendConnect, OnBackendDisconnect, OnBackendHealthChange,
-    OnBackendReady, OnBackendSwitch, OnDisconnect, OnHandshake, OnPluginMessage, OnPreLogin,
-    OnReload, OnStatusPing, OnTcpConnect,
-};
+use vex_proxy_sdk::event::{OnAttackModeChange, OnBackendKick, OnLoginSuccess};
+use vex_proxy_sdk::player::TransferResult;
 
 struct HelloPlugin;
-
-fn plugin_println(message: &str) {
-    println!("[hello_plugin] {message}");
-}
 
 impl VexPlugin for HelloPlugin {
     fn name(&self) -> &'static str {
@@ -23,74 +17,110 @@ impl VexPlugin for HelloPlugin {
     }
 
     fn version(&self) -> &'static str {
-        "3.0.0-beta"
+        "3.1.0"
     }
 
     fn on_load(&self, api: Arc<PluginApi>) -> Result<(), Box<dyn Error + Send + Sync>> {
-        plugin_println("on_load called");
-        api.logger.info(&format!("Hello from {}!", self.name()));
+        api.logger.info("Hello from hello_plugin!");
 
-        let command_api = api.clone();
-        api.commands.register(
-            self.name(),
-            "hello",
-            "Logs hello command usage",
-            move |sender, _args| match sender {
-                CommandSender::Console => {
-                    plugin_println("command /hello from console");
-                    command_api.logger.info("Hello, Console!");
-                }
-                CommandSender::Player(_player) => {
-                    plugin_println("command /hello from player (ignored)");
-                    command_api
-                        .logger
-                        .info("Player greeting is temporarily disabled");
-                }
-            },
-        );
+        api.config.save_default(
+            r#"
+greeting: "Welcome to Vex!"
+tab_header: "§bVex Proxy"
+tab_footer: "§7Have fun!"
+"#,
+        )?;
 
-        api.events
-            .on::<OnStatusPing, _, _>(move |event| async move {
-                if let Ok(mut response) = event.response.lock() {
-                    response.description = format!(
-                        "{} | {} online",
-                        response.description, response.online_players
-                    );
-                }
+        let greeting: String = api.config.get_or("greeting", "Welcome to Vex!".to_string());
+        let tab_header: String = api.config.get_or("tab_header", "§bVex Proxy".to_string());
+        let tab_footer: String = api.config.get_or("tab_footer", "§7Have fun!".to_string());
+
+        let greeted_counter =
+            api.metrics
+                .register_counter("greetings_total", "Total greeted players", &[])?;
+
+        let periodic_proxy = api.proxy.clone();
+        api.scheduler
+            .run_timer(Duration::ZERO, Duration::from_secs(30), move || {
+                let periodic_proxy = periodic_proxy.clone();
+                Box::pin(async move {
+                    periodic_proxy.broadcast(&format!(
+                        "§aVex online: {} players",
+                        periodic_proxy.online_count()
+                    ));
+                })
             });
 
-        let logger_api = api.clone();
-        api.events.on::<OnAttackModeChange, _, _>(move |event| {
-            let logger_api = logger_api.clone();
+        let greeting_scheduler = api.scheduler.clone();
+        let greeting_for_login = greeting.clone();
+        let tab_header_for_login = tab_header.clone();
+        let tab_footer_for_login = tab_footer.clone();
+        api.events.on::<OnLoginSuccess, _, _>(move |event| {
+            let greeting_scheduler = greeting_scheduler.clone();
+            let greeting_for_login = greeting_for_login.clone();
+            let tab_header_for_login = tab_header_for_login.clone();
+            let tab_footer_for_login = tab_footer_for_login.clone();
+            let greeted_counter = greeted_counter.clone();
             async move {
-                if event.active {
-                    logger_api.logger.warn(&format!(
-                        "Attack mode enabled cps={:.2} fail_ratio={:.3}",
-                        event.cps, event.fail_ratio
-                    ));
-                } else {
-                    logger_api.logger.info("Attack mode disabled");
+                let player = event.player.clone();
+                greeted_counter.inc(&[]);
+                player.set_tab_list(&tab_header_for_login, &tab_footer_for_login);
+                greeting_scheduler.run_later(Duration::from_secs(2), async move {
+                    player.send_message(&format!("§a{}, {}!", greeting_for_login, player.username));
+                    player.send_actionbar("§7Connected through Vex");
+                });
+            }
+        });
+
+        let kick_proxy = api.proxy.clone();
+        api.events.on::<OnBackendKick, _, _>(move |event| {
+            let kick_proxy = kick_proxy.clone();
+            async move {
+                let fallback = kick_proxy
+                    .get_backends()
+                    .into_iter()
+                    .find(|backend| backend.name() != event.backend.name() && backend.is_healthy());
+                let Some(fallback) = fallback else {
+                    return;
+                };
+                let player = event.player.clone();
+                let transfer_result =
+                    tokio::task::spawn_blocking(move || player.transfer(fallback))
+                        .await
+                        .unwrap_or(TransferResult::Timeout);
+                if matches!(transfer_result, TransferResult::Success) {
+                    event.cancel("redirected by hello_plugin");
                 }
             }
         });
 
-        api.events.on::<OnTcpConnect, _, _>(|_event| async move {});
-        api.events.on::<OnHandshake, _, _>(|_event| async move {});
-        api.events.on::<OnPreLogin, _, _>(|_event| async move {});
-        api.events
-            .on::<OnBackendConnect, _, _>(|_event| async move {});
-        api.events
-            .on::<OnBackendReady, _, _>(|_event| async move {});
-        api.events
-            .on::<OnBackendDisconnect, _, _>(|_event| async move {});
-        api.events
-            .on::<OnBackendSwitch, _, _>(|_event| async move {});
-        api.events
-            .on::<OnPluginMessage, _, _>(|_event| async move {});
-        api.events
-            .on::<OnBackendHealthChange, _, _>(|_event| async move {});
-        api.events.on::<OnReload, _, _>(|_event| async move {});
-        api.events.on::<OnDisconnect, _, _>(|_event| async move {});
+        let attack_logger = api.logger.clone();
+        api.events.on::<OnAttackModeChange, _, _>(move |event| {
+            let attack_logger = attack_logger.clone();
+            async move {
+                if event.active {
+                    attack_logger.warn(&format!(
+                        "Attack mode active: cps={:.2} fail_ratio={:.3}",
+                        event.cps, event.fail_ratio
+                    ));
+                } else {
+                    attack_logger.info("Attack mode disabled");
+                }
+            }
+        });
+
+        let command_logger = api.logger.clone();
+        api.commands.register(
+            self.name(),
+            "hello",
+            "Greets command sender",
+            move |sender, _args| match sender {
+                CommandSender::Console => command_logger.info("Hello, Console!"),
+                CommandSender::Player(player) => {
+                    player.send_message("§aHello from hello_plugin!");
+                }
+            },
+        );
 
         Ok(())
     }
