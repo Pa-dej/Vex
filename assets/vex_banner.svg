@@ -1,15 +1,67 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="95" height="56" viewBox="0 0 95 56">
+<svg xmlns="http://www.w3.org/2000/svg" width="95" height="35" viewBox="0 0 95 35">
+  <defs>
+    <style>
+      @keyframes look-eyes {
+        0%,8%        { transform: translateX(0); }
+        18%,30%      { transform: translateX(-1.5px); }
+        40%,52%      { transform: translateX(1.5px); }
+        62%,100%     { transform: translateX(0); }
+      }
+      @keyframes look-brows {
+        0%,10%       { transform: translateX(0); }
+        21%,30%      { transform: translateX(-0.8px); }
+        43%,52%      { transform: translateX(0.8px); }
+        64%,100%     { transform: translateX(0); }
+      }
+      .eyes  { animation: look-eyes  12s ease-in-out infinite; }
+      .brows { animation: look-brows 12s ease-in-out infinite; }
+    </style>
+  </defs>
+
+  <!--
+    icon 24x24, centered vertically in 35px: (35-24)/2 = 5.5
+    wordmark paths span y≈18..39 (21px tall), center at y≈28.5
+    shift wordmark: target center = 35/2 = 17.5, so dy = 17.5 - 28.5 = -11
+  -->
+
   <!-- icon -->
-  <g transform="translate(4, 16)">
+  <g transform="translate(4, 5.5)">
     <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
       d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16"/>
-    <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 8L10.5 9.5"/>
-    <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.5 9.5L16 8"/>
-    <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12v2"/>
-    <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12v2"/>
+    <g class="brows">
+      <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 8L10.5 9.5"/>
+      <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.5 9.5L16 8"/>
+    </g>
+    <g class="eyes">
+      <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12v2"/>
+      <path fill="none" stroke="#D07030" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12v2"/>
+    </g>
   </g>
-  <!-- wordmark as paths -->
-  <path fill="#D07030" d="M60.75 18.140625V18.96875L58.453125 19.375L50.03125 39.578125H49.234375L40.71875 19.375L38.359375 18.96875V18.140625H46.828125V18.96875L44.015625 19.375L50.359375 34.796875L56.6875 19.375L53.9375 18.96875V18.140625Z"/>
-  <path fill="#D07030" d="M65.171875 31.703125V31.984375Q65.171875 34.140625 65.6484375 35.3359375Q66.125 36.53125 67.1171875 37.15625Q68.109375 37.78125 69.71875 37.78125Q70.5625 37.78125 71.71875 37.640625Q72.875 37.5 73.625 37.328125V38.203125Q72.875 38.6875 71.5859375 39.046875Q70.296875 39.40625 68.953125 39.40625Q65.53125 39.40625 63.9453125 37.5625Q62.359375 35.71875 62.359375 31.640625Q62.359375 27.796875 63.96875 25.90625Q65.578125 24.015625 68.5625 24.015625Q74.203125 24.015625 74.203125 30.421875V31.703125ZM68.5625 25.265625Q66.9375 25.265625 66.0703125 26.578125Q65.203125 27.890625 65.203125 30.453125H71.484375Q71.484375 27.65625 70.765625 26.4609375Q70.046875 25.265625 68.5625 25.265625Z"/>
-  <path fill="#D07030" d="M90.921875 38.390625V39.09375H84.265625V38.390625L86.21875 38.03125L82.828125 32.828125L78.859375 38.0625L80.875 38.390625V39.09375H75.59375V38.390625L77.296875 38.140625L82.125 31.765625L77.875 25.5L76.140625 25.109375V24.40625H82.796875V25.109375L80.84375 25.53125L83.671875 29.75L86.921875 25.5L84.90625 25.109375V24.40625H90.1875V25.109375L88.5 25.4375L84.375 30.78125L89.203125 38.0625Z"/>
+
+  <!-- wordmark shifted up by 11px to center in 35px height -->
+  <g transform="translate(0, -11)">
+    <path fill="#D07030" d="M60.75 18.140625V18.96875L58.453125 19.375L50.03125 39.578125H49.234375L40.71875 19.375L38.359375 18.96875V18.140625H46.828125V18.96875L44.015625 19.375L50.359375 34.796875L56.6875 19.375L53.9375 18.96875V18.140625Z"/>
+    <path fill="#D07030" d="M65.171875 31.703125V31.984375Q65.171875 34.140625 65.6484375 35.3359375Q66.125 36.53125 67.1171875 37.15625Q68.109375 37.78125 69.71875 37.78125Q70.5625 37.78125 71.71875 37.640625Q72.875 37.5 73.625 37.328125V38.203125Q72.875 38.6875 71.5859375 39.046875Q70.296875 39.40625 68.953125 39.40625Q65.53125 39.40625 63.9453125 37.5625Q62.359375 35.71875 62.359375 31.640625Q62.359375 27.796875 63.96875 25.90625Q65.578125 24.015625 68.5625 24.015625Q74.203125 24.015625 74.203125 30.421875V31.703125ZM68.5625 25.265625Q66.9375 25.265625 66.0703125 26.578125Q65.203125 27.890625 65.203125 30.453125H71.484375Q71.484375 27.65625 70.765625 26.4609375Q70.046875 25.265625 68.5625 25.265625Z"/>
+    <path fill="#D07030" d="M90.921875 38.390625V39.09375H84.265625V38.390625L86.21875 38.03125L82.828125 32.828125L78.859375 38.0625L80.875 38.390625V39.09375H75.59375V38.390625L77.296875 38.140625L82.125 31.765625L77.875 25.5L76.140625 25.109375V24.40625H82.796875V25.109375L80.84375 25.53125L83.671875 29.75L86.921875 25.5L84.90625 25.109375V24.40625H90.1875V25.109375L88.5 25.4375L84.375 30.78125L89.203125 38.0625Z"/>
+  </g>
+
+  <script><![CDATA[
+    const rand = (min, max) => min + Math.random() * (max - min);
+    const eyes  = document.querySelector('.eyes');
+    const brows = document.querySelector('.brows');
+    const delay = rand(-10, 0).toFixed(1) + 's';
+    eyes.style.animationDelay  = delay;
+    brows.style.animationDelay = delay;
+    function restartWithRandomDuration() {
+      const dur = rand(10, 18).toFixed(1) + 's';
+      [eyes, brows].forEach(el => {
+        el.style.animation = 'none';
+        el.offsetWidth;
+      });
+      eyes.style.animation  = `look-eyes  ${dur} ease-in-out`;
+      brows.style.animation = `look-brows ${dur} ease-in-out`;
+      eyes.addEventListener('animationend', restartWithRandomDuration, { once: true });
+    }
+    eyes.addEventListener('animationend', restartWithRandomDuration, { once: true });
+  ]]></script>
 </svg>
