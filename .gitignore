@@ -1,2 +1,51 @@
+# Build outputs
 /target
-__pycache__
+**/target
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.log.*
+*.cache
+*.bak
+*.old
+*.orig
+*.swp
+*.swo
+
+# Editor/IDE state
+.vscode/
+.idea/
+.project
+.classpath
+.history
+*.user
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Icon?
+
+# Archives and packages
+*.tgz
+*.tar.gz
+*.zip
+*.7z
+*.exe
+
+# Workspace temporary dirs
+.tmp*/
+.tmp_*
+.tmp_md*
+.tmp_proto*
+.tmp_run.*
+.tmp_server_*
+.vex_*.log

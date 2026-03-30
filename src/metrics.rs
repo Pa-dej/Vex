@@ -9,7 +9,7 @@ use prometheus::{
 
 #[derive(Clone)]
 pub struct Metrics {
-    registry: Registry,
+    registry: Arc<Registry>,
     active_connections: IntGauge,
     backend_inflight: IntGaugeVec,
     backend_connect_errors_total: IntCounterVec,
@@ -38,7 +38,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Result<Self> {
-        let registry = Registry::new();
+        let registry = Arc::new(Registry::new());
 
         let active_connections = IntGauge::with_opts(Opts::new(
             "vex_active_connections",
@@ -449,6 +449,10 @@ impl Metrics {
         let families = self.registry.gather();
         encoder.encode(&families, &mut output)?;
         Ok(String::from_utf8(output)?)
+    }
+
+    pub fn registry(&self) -> Arc<Registry> {
+        self.registry.clone()
     }
 
     fn sample_runtime_metrics(&self) {

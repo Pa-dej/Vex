@@ -50,7 +50,7 @@ address = "127.0.0.1:25565"
 weight = 1.0
 
 [observability]
-log_level = "error"
+log_level = "debug"
 log_format = "pretty"
 
 [admin]
@@ -67,3 +67,16 @@ path = "config/protocol_ids.toml"
 [forwarding.velocity]
 enabled = true
 secret = "test-secret-123"
+
+[plugins]
+enabled = true
+dir = "plugins"
+event_handler_timeout_ms = 500
+intercept_plugin_messages = false
+watch = false
+watch_debounce_ms = 500
+
+[status]
+motd = "§bA §fVex §bProxy"
+max_players = 1000
+show_real_online = true

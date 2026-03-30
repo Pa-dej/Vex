@@ -133,7 +133,6 @@ pub fn parse_login_start_username(payload: &[u8]) -> Result<Option<String>> {
     Ok(Some(username))
 }
 
-#[cfg(test)]
 pub fn build_login_start_packet(username: &str) -> Vec<u8> {
     let mut payload = BytesMut::with_capacity(username.len() + 8);
     write_varint(0, &mut payload);
@@ -178,13 +177,13 @@ pub fn parse_encryption_response(payload: &[u8]) -> Result<Option<EncryptionResp
     }
 
     let remaining = &payload[offset..];
-    if let Ok((verify_token, read)) = parse_byte_array(remaining) {
-        if read == remaining.len() {
-            return Ok(Some(EncryptionResponse {
-                shared_secret,
-                verify_token,
-            }));
-        }
+    if let Ok((verify_token, read)) = parse_byte_array(remaining)
+        && read == remaining.len()
+    {
+        return Ok(Some(EncryptionResponse {
+            shared_secret,
+            verify_token,
+        }));
     }
 
     let has_verify_token = remaining[0] != 0;
@@ -233,10 +232,8 @@ pub fn build_login_plugin_response(message_id: i32, success: bool, data: Option<
     write_varint(0x02, &mut payload);
     write_varint(message_id, &mut payload);
     payload.put_u8(if success { 1 } else { 0 });
-    if success {
-        if let Some(data) = data {
-            payload.put_slice(data);
-        }
+    if success && let Some(data) = data {
+        payload.put_slice(data);
     }
     payload.to_vec()
 }
@@ -463,6 +460,82 @@ pub fn build_status_request() -> Vec<u8> {
     payload.to_vec()
 }
 
+pub fn build_respawn_packet(protocol: u32) -> Vec<u8> {
+    if protocol != 774 {
+        return Vec::new();
+    }
+
+    let mut payload = BytesMut::with_capacity(128);
+    write_varint(0x47, &mut payload);
+    write_mc_string("minecraft:overworld", &mut payload); // dimension_type
+    write_mc_string("minecraft:overworld", &mut payload); // dimension_name
+    payload.put_i64(0); // hashed_seed
+    payload.put_u8(0); // gamemode (survival)
+    payload.put_i8(-1); // previous gamemode
+    payload.put_u8(0); // is_debug
+    payload.put_u8(0); // is_flat
+    payload.put_u8(0); // has_death_location
+    write_varint(0, &mut payload); // portal_cooldown
+    write_varint(64, &mut payload); // sea_level
+    payload.to_vec()
+}
+
+pub fn build_play_plugin_message_packet(
+    protocol: u32,
+    clientbound: bool,
+    channel: &str,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let packet_id = match (protocol, clientbound) {
+        // 1.21.11 (protocol 774): ClientboundCustomPayloadPacket / ServerboundCustomPayloadPacket
+        (774, true) => 0x18,
+        (774, false) => 0x15,
+        _ => return None,
+    };
+    let mut payload = BytesMut::with_capacity(channel.len() + data.len() + 16);
+    write_varint(packet_id, &mut payload);
+    write_mc_string(channel, &mut payload);
+    payload.put_slice(data);
+    Some(payload.to_vec())
+}
+
+pub fn build_play_system_chat_packet(
+    protocol: u32,
+    message: &str,
+    is_action_bar: bool,
+) -> Option<Vec<u8>> {
+    let packet_id = match protocol {
+        // 1.21.11 (protocol 774): ClientboundSystemChatPacket
+        774 => 0x77,
+        _ => return None,
+    };
+
+    let mut payload = BytesMut::with_capacity(message.len() + 32);
+    write_varint(packet_id, &mut payload);
+    write_anonymous_nbt_text_component(message, &mut payload);
+    payload.put_u8(u8::from(is_action_bar));
+    Some(payload.to_vec())
+}
+
+pub fn parse_play_plugin_message_packet(
+    payload: &[u8],
+    protocol: u32,
+    clientbound: bool,
+) -> Result<Option<(String, usize)>> {
+    let expected_id = match (protocol, clientbound) {
+        (774, true) => 0x18,
+        (774, false) => 0x15,
+        _ => return Ok(None),
+    };
+    let (packet_id, mut offset) = parse_varint(payload).context("missing packet id")?;
+    if packet_id != expected_id {
+        return Ok(None);
+    }
+    let (channel, read) = parse_mc_string(&payload[offset..]).context("missing channel")?;
+    offset += read;
+    Ok(Some((channel, offset)))
+}
+
 pub fn build_handshake_packet(
     protocol_version: i32,
     host: &str,
@@ -530,6 +603,21 @@ fn parse_mc_string(input: &[u8]) -> Result<(String, usize)> {
 fn write_mc_string(value: &str, buf: &mut BytesMut) {
     write_varint(value.len() as i32, buf);
     buf.put_slice(value.as_bytes());
+}
+
+fn write_anonymous_nbt_text_component(text: &str, buf: &mut BytesMut) {
+    // anonymousNbt compound: { text: "<message>" }
+    buf.put_u8(0x0A); // TAG_Compound (unnamed)
+
+    buf.put_u8(0x08); // TAG_String
+    buf.put_u16(4); // key length: "text"
+    buf.put_slice(b"text");
+
+    let text_len = text.len().min(u16::MAX as usize);
+    buf.put_u16(text_len as u16);
+    buf.put_slice(&text.as_bytes()[..text_len]);
+
+    buf.put_u8(0x00); // TAG_End
 }
 
 fn parse_byte_array(input: &[u8]) -> Result<(Vec<u8>, usize)> {
@@ -622,5 +710,14 @@ mod tests {
         let wrapped = encode_login_packet_for_backend(&inner, Some(1)).expect("encode");
         let decoded = decode_login_packet_from_backend(&wrapped, true).expect("decode");
         assert_eq!(decoded, inner.to_vec());
+    }
+
+    #[test]
+    fn system_chat_packet_has_expected_id_and_flag() {
+        let packet = build_play_system_chat_packet(774, "Hello", false).expect("packet");
+        let (packet_id, offset) = parse_varint(&packet).expect("packet id");
+        assert_eq!(packet_id, 0x77);
+        assert_eq!(packet.last().copied(), Some(0));
+        assert!(offset < packet.len());
     }
 }

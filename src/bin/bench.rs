@@ -232,7 +232,7 @@ async fn reporter_loop(stats: Arc<Stats>, mut stop_rx: watch::Receiver<bool>) {
 
                 let (p50, p99, p999) = {
                     let hist = stats.latency_hist.lock().await;
-                    if hist.len() == 0 {
+                    if hist.is_empty() {
                         (0_u64, 0_u64, 0_u64)
                     } else {
                         (
@@ -521,15 +521,15 @@ async fn run_configuration_phase(
 
         if packet_id == CONFIG_CLIENTBOUND_PLUGIN_MESSAGE_ID {
             saw_configuration_packet = true;
-            if let Some(channel) = parse_prefixed_string(&payload[read..]) {
-                if channel == "minecraft:brand" {
-                    let response = build_configuration_brand_response("vanilla");
-                    if write_packet(stream, &response, *compression_threshold, stats)
-                        .await
-                        .is_err()
-                    {
-                        return Err(PlayExitReason::Disconnected);
-                    }
+            if let Some(channel) = parse_prefixed_string(&payload[read..])
+                && channel == "minecraft:brand"
+            {
+                let response = build_configuration_brand_response("vanilla");
+                if write_packet(stream, &response, *compression_threshold, stats)
+                    .await
+                    .is_err()
+                {
+                    return Err(PlayExitReason::Disconnected);
                 }
             }
             continue;
@@ -587,7 +587,7 @@ async fn print_final_report(cli: &Cli, started: Instant, stats: Arc<Stats>) {
 
     let (min, p50, p99, p999, max) = {
         let hist = stats.latency_hist.lock().await;
-        if hist.len() == 0 {
+        if hist.is_empty() {
             (0, 0, 0, 0, 0)
         } else {
             (
@@ -673,9 +673,7 @@ fn build_login_start(username: &str, protocol: i32) -> Vec<u8> {
     payload.extend_from_slice(&encode_varint(0));
     payload.extend_from_slice(&encode_varint(username_bytes.len() as i32));
     payload.extend_from_slice(username_bytes);
-    if protocol >= 764 {
-        payload.push(0);
-    } else if protocol == 763 {
+    if protocol >= 763 {
         payload.push(0);
     }
     payload

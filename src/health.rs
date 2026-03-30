@@ -1,8 +1,11 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
+use vex_sdk::event::{HealthState, OnBackendHealthChange};
+use vex_sdk::server::{BackendInfo, BackendRef};
 
 use crate::mc::{
     build_handshake_packet, build_status_request, parse_packet_id, read_packet, write_packet,
@@ -84,11 +87,33 @@ pub fn spawn_health_checker(state: RuntimeState) {
                 state
                     .metrics
                     .set_backend_health_state(backend.name(), new_state.encoded());
+
+                if new_state != previous_state {
+                    let plugin_runtime = state.plugin_runtime();
+                    let event = Arc::new(OnBackendHealthChange {
+                        backend: BackendRef::new(BackendInfo::new(
+                            backend.name().to_string(),
+                            backend.address().to_string(),
+                            new_state != crate::backend::BackendHealth::Unhealthy,
+                        )),
+                        old_state: to_health_state(previous_state),
+                        new_state: to_health_state(new_state),
+                    });
+                    let _ = plugin_runtime.events.dispatch(event).await;
+                }
             }
 
             tokio::time::sleep(Duration::from_millis(cfg.interval_ms)).await;
         }
     });
+}
+
+fn to_health_state(state: crate::backend::BackendHealth) -> HealthState {
+    match state {
+        crate::backend::BackendHealth::Healthy => HealthState::Healthy,
+        crate::backend::BackendHealth::Degraded => HealthState::Degraded,
+        crate::backend::BackendHealth::Unhealthy => HealthState::Unhealthy,
+    }
 }
 
 async fn probe_status(
@@ -150,4 +175,76 @@ fn split_host_port(addr: &str) -> anyhow::Result<(&str, u16)> {
         .ok_or_else(|| anyhow::anyhow!("address missing host"))?;
     let port: u16 = port_part.parse()?;
     Ok((host, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+    use vex_sdk::event::{HealthState, OnBackendHealthChange};
+
+    use super::spawn_health_checker;
+    use crate::backend::BackendPool;
+    use crate::config::{BackendConfig, Config};
+    use crate::metrics::Metrics;
+    use crate::protocol_map::ProtocolMap;
+    use crate::state::RuntimeState;
+
+    #[tokio::test]
+    async fn health_transitions_dispatch_backend_health_change_event() -> anyhow::Result<()> {
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_addr = probe.local_addr()?;
+        drop(probe);
+
+        let mut config = Config::default();
+        config.routing.backends = vec![BackendConfig {
+            name: "health-test".to_string(),
+            address: backend_addr.to_string(),
+            weight: 1.0,
+        }];
+        config.health.interval_ms = 25;
+        config.health.status_timeout_ms = 25;
+        config.health.tcp_timeout_ms = 25;
+
+        let protocol_map = ProtocolMap::load(Path::new("config/protocol_ids.toml"))?;
+        let metrics = Arc::new(Metrics::new()?);
+        let backends = BackendPool::from_config(&config.routing, metrics.clone())?;
+        let state = RuntimeState::new(config, protocol_map, metrics, backends)?;
+
+        let (tx, rx) = oneshot::channel::<(String, HealthState, HealthState)>();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+        let sender_for_handler = sender.clone();
+        state
+            .plugin_runtime()
+            .events
+            .with_plugin("test-health-change")
+            .on::<OnBackendHealthChange, _, _>(move |event| {
+                let sender_for_handler = sender_for_handler.clone();
+                async move {
+                    if let Ok(mut guard) = sender_for_handler.lock()
+                        && let Some(tx) = guard.take()
+                    {
+                        let _ = tx.send((
+                            event.backend.name().to_string(),
+                            event.old_state,
+                            event.new_state,
+                        ));
+                    }
+                }
+            });
+
+        spawn_health_checker(state.clone());
+        let (backend_name, old_state, new_state) = timeout(Duration::from_secs(3), rx).await??;
+        assert_eq!(backend_name, "health-test");
+        assert_eq!(old_state, HealthState::Healthy);
+        assert_eq!(new_state, HealthState::Unhealthy);
+
+        state.shutdown.trigger("test complete".to_string());
+        Ok(())
+    }
 }

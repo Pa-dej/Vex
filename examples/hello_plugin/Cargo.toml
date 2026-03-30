@@ -1,0 +1,11 @@
+[package]
+name = "hello_plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bytes = "1.10"
+vex_sdk = { package = "Vex", path = "../.." }

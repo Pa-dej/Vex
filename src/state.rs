@@ -1,8 +1,14 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::sync::{RwLock, Semaphore};
+use uuid::Uuid;
+use vex_sdk::api::{CommandRegistry, EventBus, ProxyHandle, ProxyOps};
+use vex_sdk::event::OnPermissionCheck;
+use vex_sdk::player::ProxiedPlayer;
+use vex_sdk::server::{BackendInfo, BackendRef};
 
 use crate::analytics::AttackAnalytics;
 use crate::auth_circuit::AuthCircuitBreaker;
@@ -14,6 +20,7 @@ use crate::memory::MemoryBudget;
 use crate::metrics::Metrics;
 use crate::protocol_map::ProtocolMap;
 use crate::reputation::ReputationStore;
+use crate::session_registry::SessionRegistry;
 use crate::shutdown::ShutdownManager;
 
 pub struct RuntimeSnapshot {
@@ -47,6 +54,94 @@ pub struct RuntimeState {
     limiter: Arc<ConnectionLimiter>,
     reputation: Arc<ReputationStore>,
     attack_analytics: Arc<AttackAnalytics>,
+    plugin_runtime: Arc<PluginRuntime>,
+}
+
+#[derive(Clone)]
+pub struct PluginRuntime {
+    pub events: Arc<EventBus>,
+    pub commands: Arc<CommandRegistry>,
+    pub proxy: Arc<ProxyHandle>,
+    pub sessions: Arc<SessionRegistry>,
+    active_plugins: Arc<AtomicUsize>,
+}
+
+impl PluginRuntime {
+    pub fn active_plugins(&self) -> usize {
+        self.active_plugins.load(Ordering::Relaxed)
+    }
+
+    pub fn has_active_plugins(&self) -> bool {
+        self.active_plugins() > 0
+    }
+
+    pub fn set_active_plugins(&self, count: usize) {
+        self.active_plugins.store(count, Ordering::Relaxed);
+    }
+
+    pub fn active_plugins_counter(&self) -> Arc<AtomicUsize> {
+        self.active_plugins.clone()
+    }
+}
+
+struct RuntimeProxyOps {
+    snapshot: Arc<ArcSwap<RuntimeSnapshot>>,
+    sessions: Arc<SessionRegistry>,
+}
+
+impl ProxyOps for RuntimeProxyOps {
+    fn get_players(&self) -> Vec<ProxiedPlayer> {
+        self.sessions.get_players()
+    }
+
+    fn get_player(&self, username: &str) -> Option<ProxiedPlayer> {
+        self.sessions.get_player(username)
+    }
+
+    fn get_player_by_uuid(&self, uuid: Uuid) -> Option<ProxiedPlayer> {
+        self.sessions.get_player_by_uuid(uuid)
+    }
+
+    fn get_backends(&self) -> Vec<BackendRef> {
+        let snapshot = self.snapshot.load_full();
+        snapshot
+            .backends
+            .backends()
+            .iter()
+            .map(|backend| {
+                BackendRef::new(BackendInfo::new(
+                    backend.name().to_string(),
+                    backend.address().to_string(),
+                    backend.health() != crate::backend::BackendHealth::Unhealthy,
+                ))
+            })
+            .collect()
+    }
+
+    fn broadcast(&self, message: &str) {
+        self.sessions.broadcast(message);
+    }
+
+    fn broadcast_to(&self, message: &str, filter: &(dyn Fn(&ProxiedPlayer) -> bool + Send + Sync)) {
+        self.sessions.broadcast_to(message, filter);
+    }
+
+    fn online_count(&self) -> usize {
+        self.sessions.online_count()
+    }
+
+    fn online_count_for(&self, backend: &BackendRef) -> usize {
+        self.sessions.online_count_for(backend)
+    }
+
+    fn forward_plugin_message(
+        &self,
+        channel: &str,
+        data: bytes::Bytes,
+        filter: &(dyn Fn(&ProxiedPlayer) -> bool + Send + Sync),
+    ) {
+        self.sessions.forward_plugin_message(channel, data, filter);
+    }
 }
 
 impl RuntimeState {
@@ -69,12 +164,52 @@ impl RuntimeState {
             .unwrap_or_else(|_| "https://sessionserver.mojang.com".to_string());
         let reputation = Arc::new(ReputationStore::new(config.reputation.clone()));
         let attack_analytics = Arc::new(AttackAnalytics::new(config.anti_bot.clone()));
+        let snapshot = Arc::new(ArcSwap::from_pointee(RuntimeSnapshot::new(
+            config.clone(),
+            protocol_map,
+            backends,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let events = Arc::new(EventBus::new(Duration::from_millis(
+            config.plugins.event_handler_timeout_ms,
+        )));
+        let commands = Arc::new(CommandRegistry::new());
+        let permission_events = events.clone();
+        commands.set_permission_checker(move |player, permission| {
+            let event = Arc::new(OnPermissionCheck::new(
+                player.clone(),
+                permission.to_string(),
+                true,
+            ));
+            let dispatch_events = permission_events.clone();
+            let dispatch_event = event.clone();
+            let join = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(runtime) = runtime {
+                    runtime.block_on(async move {
+                        let _ = dispatch_events.dispatch(dispatch_event).await;
+                    });
+                }
+            });
+            let _ = join.join();
+            event.is_allowed()
+        });
+        let proxy = Arc::new(ProxyHandle::new(Arc::new(RuntimeProxyOps {
+            snapshot: snapshot.clone(),
+            sessions: sessions.clone(),
+        })));
+        let plugin_runtime = Arc::new(PluginRuntime {
+            events,
+            commands,
+            proxy,
+            sessions,
+            active_plugins: Arc::new(AtomicUsize::new(0)),
+        });
+
         Ok(Self {
-            snapshot: Arc::new(ArcSwap::from_pointee(RuntimeSnapshot::new(
-                config.clone(),
-                protocol_map,
-                backends,
-            ))),
+            snapshot,
             metrics,
             shutdown: ShutdownManager::new(),
             connection_slots: Arc::new(ArcSwap::from_pointee(Semaphore::new(max_connections))),
@@ -91,6 +226,7 @@ impl RuntimeState {
             )),
             reputation,
             attack_analytics,
+            plugin_runtime,
         })
     }
 
@@ -142,6 +278,10 @@ impl RuntimeState {
         self.attack_analytics.clone()
     }
 
+    pub fn plugin_runtime(&self) -> Arc<PluginRuntime> {
+        self.plugin_runtime.clone()
+    }
+
     pub async fn apply_reload(
         &self,
         config: Config,
@@ -160,5 +300,10 @@ impl RuntimeState {
             backends,
         )));
         self.set_auth_mode(config.auth.mode).await;
+        self.plugin_runtime
+            .events
+            .set_timeout(Duration::from_millis(
+                config.plugins.event_handler_timeout_ms,
+            ));
     }
 }

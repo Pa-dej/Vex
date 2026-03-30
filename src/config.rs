@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub listener: ListenerConfig,
@@ -19,25 +19,8 @@ pub struct Config {
     pub admin: AdminConfig,
     pub shutdown: ShutdownConfig,
     pub protocol_map: ProtocolMapConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            listener: ListenerConfig::default(),
-            routing: RoutingConfig::default(),
-            auth: AuthConfig::default(),
-            forwarding: ForwardingConfig::default(),
-            limits: LimitsConfig::default(),
-            anti_bot: AntiBotConfig::default(),
-            reputation: ReputationConfig::default(),
-            health: HealthConfig::default(),
-            observability: ObservabilityConfig::default(),
-            admin: AdminConfig::default(),
-            shutdown: ShutdownConfig::default(),
-            protocol_map: ProtocolMapConfig::default(),
-        }
-    }
+    pub plugins: PluginsConfig,
+    pub status: StatusConfig,
 }
 
 impl Config {
@@ -123,34 +106,17 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ForwardingConfig {
     pub velocity: VelocityForwardingConfig,
 }
 
-impl Default for ForwardingConfig {
-    fn default() -> Self {
-        Self {
-            velocity: VelocityForwardingConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct VelocityForwardingConfig {
     pub enabled: bool,
     pub secret: String,
-}
-
-impl Default for VelocityForwardingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            secret: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -316,6 +282,48 @@ impl Default for ProtocolMapConfig {
     fn default() -> Self {
         Self {
             path: "config/protocol_ids.toml".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    pub enabled: bool,
+    pub dir: String,
+    pub event_handler_timeout_ms: u64,
+    pub intercept_plugin_messages: bool,
+    pub watch: bool,
+    pub watch_debounce_ms: u64,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: "plugins".to_string(),
+            event_handler_timeout_ms: 500,
+            intercept_plugin_messages: false,
+            watch: false,
+            watch_debounce_ms: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StatusConfig {
+    pub motd: String,
+    pub max_players: i32,
+    pub show_real_online: bool,
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            motd: "§bA §fVex §bProxy".to_string(),
+            max_players: 1000,
+            show_real_online: true,
         }
     }
 }
